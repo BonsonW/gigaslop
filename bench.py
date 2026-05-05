@@ -22,15 +22,14 @@ def dequantize_tensor(t_int8, scale):
     return t_int8.to(torch.float32) * scale
 
 # Simple test params - use larger size to match tile boundaries
-batch_size = 1
-M = 128
-N = 128
-K = 128
+batch_size = 2
+timestep = 128
+out_features = 128
+in_features = 128
 
 # Create float input tensors
-A_float = torch.randn((M, K, batch_size), dtype=torch.float32, device='cuda')
-B_float = torch.randn((N, K, batch_size), dtype=torch.float32, device='cuda')
-
+A_float = torch.randn((batch_size, timestep, in_features), dtype=torch.float32, device='cuda').reshape(batch_size * timestep, in_features, 1)
+B_float = torch.randn((batch_size, out_features, in_features), dtype=torch.float32, device='cuda').reshape(batch_size * out_features, in_features, 1)
 print(f"A_float shape: {A_float.shape}, B_float shape: {B_float.shape}")
 
 # Quantize to int8
@@ -41,7 +40,7 @@ print(f"A_scale: {A_scale}, B_scale: {B_scale}")
 print(f"A_int8 shape: {A_int8.shape}, B_int8 shape: {B_int8.shape}")
 
 # Create output buffer
-C = torch.zeros((M, N, batch_size), dtype=torch.int32, device='cuda')
+C = torch.zeros((batch_size * timestep, out_features, 1), dtype=torch.int32, device='cuda')
 
 print(f"C shape: {C.shape}")
 
@@ -74,8 +73,8 @@ print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=10))
 C_dequantized = dequantize_tensor(C, A_scale * B_scale)
 
 # Float reference: A_float @ B_float^T
-A_ref = A_float[:, :, 0]  # (M, K)
-B_ref = B_float[:, :, 0]  # (N, K)
+A_ref = A_float.reshape(batch_size * timestep, in_features)  # (M, K)
+B_ref = B_float.reshape(batch_size * out_features, in_features)  # (N, K)
 C_ref = torch.matmul(A_ref, B_ref.t())  # (M, N)
 
 print(f"\nC_dequantized shape: {C_dequantized.shape}")
@@ -84,9 +83,10 @@ print(f"\nC_dequantized[:3, :3]:\n{C_dequantized[:3, :3, 0]}")
 print(f"C_ref[:3, :3]:\n{C_ref[:3, :3]}")
 
 # Compare
-if torch.allclose(C_dequantized[:, :, 0], C_ref, atol=2.0, rtol=1e-1):
+C_ref_match = C_ref[:, :out_features]
+if torch.allclose(C_dequantized[:, :, 0], C_ref_match, atol=2.0, rtol=1e-1):
     print("\n✓ Results match!")
 else:
     print("\n✗ Results differ")
-    print(f"Max diff: {(C_dequantized[:, :, 0] - C_ref).abs().max()}")
-    print(f"Mean diff: {(C_dequantized[:, :, 0] - C_ref).abs().mean()}")
+    print(f"Max diff: {(C_dequantized[:, :, 0] - C_ref_match).abs().max()}")
+    print(f"Mean diff: {(C_dequantized[:, :, 0] - C_ref_match).abs().mean()}")
