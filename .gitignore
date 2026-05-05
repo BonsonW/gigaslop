@@ -1,0 +1,4 @@
+artifacts/*.o
+py310
+notes.sh
+*__pycache__
