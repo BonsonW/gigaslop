@@ -1,4 +1,4 @@
-artifacts/*.o
+artifacts/*
 pyvenv/
 notes.sh
 *__pycache__/
