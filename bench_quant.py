@@ -28,116 +28,161 @@ def quantize_tensor(t, dim=-1):
 
     return t_int8, dequant_scale
 
-# Simple test params - use larger size to match tile boundaries
-batch_size = 512
-timestep = 1024
+# ── problem size ────────────────────────────────────────────────────────────
+batch_size   = 512
+timestep     = 1024
+in_features  = 512
 out_features = 512
-in_features = 512
 
-# Create float input tensors
-A_float = torch.randn((batch_size, timestep, in_features), dtype=torch.float16, device='cuda').reshape(batch_size * timestep, in_features)
-B_float = torch.randn((out_features, in_features), dtype=torch.float16, device='cuda').reshape(out_features, in_features)
-print(f"A_float shape: {A_float.shape}, B_float shape: {B_float.shape}")
+M = batch_size * timestep
+K = in_features
+N = out_features
+L = 1
 
-# Quantize to int8
-A_int8, A_scale = quantize_tensor(A_float, dim=-1)
-B_int8, B_scale = quantize_tensor(B_float, dim=-1)
+# ── your torch tensors (whatever you have) ──────────────────────────────────
+A_float = torch.randn(M, K, dtype=torch.float32)
+B_float = torch.randn(N, K, dtype=torch.float32)
 
-A_int8 = A_int8.reshape(batch_size * timestep, in_features, 1)
-B_int8 = B_int8.reshape(out_features, in_features, 1)
+# quantise to int8 (replace with your real quantisation logic)
+A_scale = A_float.abs().max(dim=1, keepdim=True).values / 127.0   # (M, 1)
+B_scale = B_float.abs().max(dim=1, keepdim=True).values / 127.0   # (N, 1)
+A_int8  = (A_float / A_scale).round().clamp(-128, 127).to(torch.int8)
+B_int8  = (B_float / B_scale).round().clamp(-128, 127).to(torch.int8)
 
-A_scale = A_scale.reshape(A_scale.size(0), 1)
-B_scale = B_scale.reshape(B_scale.size(0), 1)
+print(f"A_float  {A_float.shape}  B_float  {B_float.shape}")
+print(f"A_int8   {A_int8.shape}   B_int8   {B_int8.shape}")
+print(f"A_scale  {A_scale.shape}  B_scale  {B_scale.shape}")
 
-# print(f"A_scale: {A_scale}, B_scale: {B_scale}")
-print(f"A_int8 shape: {A_int8.shape}, B_int8 shape: {B_int8.shape}")
-print(f"A_scale shape: {A_scale.shape}, B_scale shape: {B_scale.shape}")
+# ── kernel config ────────────────────────────────────────────────────────────
+a_dtype       = cutlass.Int8
+b_dtype       = cutlass.Int8
+c_dtype       = cutlass.Float16
+acc_dtype     = cutlass.Int32
+use_k32       = True
+atom_layout_mnk = (2, 2, 1)
 
-# Create output buffer
-C = torch.zeros((batch_size * timestep, out_features, 1), dtype=torch.float16, device='cuda')
+if   M <= 16:  bm = 16
+elif M <= 32:  bm = 32
+elif M <= 64:  bm = 64
+else:          bm = 128
 
-print(f"C shape: {C.shape}")
+bN, bK = 128, 64
+M_pad = ((M + bm - 1) // bm) * bm
+N_pad = ((N + bN - 1) // bN) * bN
+K_pad = ((K + bK - 1) // bK) * bK
 
-# Convert to CUTE tensors
-mA = from_dlpack(A_int8, assumed_align=16)
-mB = from_dlpack(B_int8, assumed_align=16)
-mC = from_dlpack(C, assumed_align=16)
+# ── pack torch tensors into the layout CuteDSL expects ──────────────────────
+# Rule: create (L, mode0, mode1) → permute(1,2,0) → (mode0, mode1, L)
+# After permute + contiguous: strides = (mode1, 1, mode0*mode1)
+# leading_dim=1 is always the contiguous dim (K for A/B, N for C)
 
-mAScale = from_dlpack(A_scale, assumed_align=16)
-mBScale = from_dlpack(B_scale, assumed_align=16)
+def pack_input(t_2d, rows, cols, row_pad, col_pad, torch_dtype):
+    """
+    t_2d : (rows, cols) torch tensor
+    returns (row_pad, col_pad, L) cute-compatible tensor + raw torch tensor
+    """
+    buf = torch.zeros(L, row_pad, col_pad, dtype=torch_dtype, device='cuda')
+    buf[0, :rows, :cols] = t_2d.to(torch_dtype).cuda()
+    t = buf.permute(1, 2, 0).contiguous()   # (row_pad, col_pad, L)
+    return t
 
-# Setup and compile kernel
+def pack_output(rows, cols, torch_dtype):
+    buf = torch.zeros(L, rows, cols, dtype=torch_dtype, device='cuda')
+    return buf.permute(1, 2, 0).contiguous()   # (rows, cols, L)
+
+def wrap_AB(t, dtype):
+    """K-major input: leading_dim=1 (K is contiguous)"""
+    return (
+        from_dlpack(t, assumed_align=16)
+        .mark_layout_dynamic(leading_dim=1)
+        .mark_compact_shape_dynamic(
+            mode=0,
+            stride_order=(2, 0, 1),
+            divisibility=(128 // dtype.width),
+        )
+    )
+
+def wrap_C(t, dtype):
+    """N-major output: leading_dim=1 (N is contiguous)"""
+    return (
+        from_dlpack(t, assumed_align=16)
+        .mark_layout_dynamic(leading_dim=1)
+        .mark_compact_shape_dynamic(
+            mode=0,
+            stride_order=(2, 0, 1),
+            divisibility=(128 // dtype.width),
+        )
+    )
+
+a_torch = pack_input(A_int8, M, K, M_pad, K_pad, torch.int8)
+b_torch = pack_input(B_int8, N, K, N_pad, K_pad, torch.int8)
+c_torch = pack_output(M_pad, N_pad, cutlass_torch.dtype(c_dtype))
+
+mA = wrap_AB(a_torch, cutlass.Int8)
+mB = wrap_AB(b_torch, cutlass.Int8)
+mC = wrap_C (c_torch, c_dtype)
+
+# scales: (M_pad, L) and (N_pad, L), float32
+scale_a_torch = torch.zeros(M_pad, L, dtype=torch.float32, device='cuda')
+scale_b_torch = torch.zeros(N_pad, L, dtype=torch.float32, device='cuda')
+scale_a_torch[:M, 0] = A_scale[:, 0].cuda()
+scale_b_torch[:N, 0] = B_scale[:, 0].cuda()
+mScaleA = from_dlpack(scale_a_torch.contiguous(), assumed_align=4)
+mScaleB = from_dlpack(scale_b_torch.contiguous(), assumed_align=4)
+
+print(f"a_torch strides: {a_torch.stride()}")   # (K_pad, 1, M_pad*K_pad)
+print(f"b_torch strides: {b_torch.stride()}")   # (K_pad, 1, N_pad*K_pad)
+print(f"c_torch strides: {c_torch.stride()}")   # (N_pad, 1, M_pad*N_pad)
+
+# ── compile ──────────────────────────────────────────────────────────────────
 tensor_op_gemm = TensorOpGemmI8(
-    cutlass.Int8,
-    cutlass.Int8,
-    cutlass.Float16,
-    cutlass.Int32,
-    atom_layout_mnk=(2, 2, 1),
-    use_k32=False,
-    bm=128,
+    a_dtype, b_dtype, c_dtype, acc_dtype,
+    atom_layout_mnk, use_k32, bm,
 )
 
-print('=== Compiling ampere_gemm kernel ===')
-# compiled_gemm = cute.compile(tensor_op_gemm, mA, mB, mC)
-compiled_gemm = cute.compile(tensor_op_gemm, mA, mB, mC, mAScale, mBScale)
+print("\n=== Compiling ===")
+compiled_gemm = cute.compile(tensor_op_gemm, mA, mB, mC, mScaleA, mScaleB)
+compiled_gemm(mA, mB, mC, mScaleA, mScaleB)
 
-print('=== Running GEMM === ')
-compiled_gemm(mA, mB, mC, mAScale, mBScale)
+# result lives in c_torch[:M, :N, 0]
+result = c_torch[:M, :N, 0]
+print(f"Output shape: {result.shape}, dtype: {result.dtype}")
 
-# Dequantize output: C_int32 * A_scale * B_scale
-C_dequantized = C
+# ── optional: verify against torch reference ─────────────────────────────────
+with torch.inference_mode():
+    ref = (A_float.cuda() @ B_float.cuda().T).to(torch.float16)
+    kernel_out = result.cpu().float()
+    ref_out    = ref.cpu().float()
+    print(f"Max abs error vs fp32 ref: {(kernel_out - ref_out).abs().max():.4f}")
 
-# Float reference: A_float @ B_float^T
-A_ref = A_float.reshape(batch_size * timestep, in_features)  # (M, K)
-B_ref = B_float.reshape(out_features, in_features).t()  # (K, N)
-C_ref = torch.matmul(A_ref, B_ref)  # (M, N)
-
-print(f"\nC_dequantized shape: {C_dequantized.shape}")
-print(f"C_ref shape: {C_ref.shape}")
-print(f"\nC_dequantized[:3, :3]:\n{C_dequantized[:3, :3, 0]}")
-print(f"C_ref[:3, :3]:\n{C_ref[:3, :3]}")
-
-# Compare
-C_ref_match = C_ref[:, :out_features]
-if torch.allclose(C_dequantized[:, :, 0], C_ref_match, atol=2.0, rtol=1e-1):
-    print("\n✓ Results match!")
-else:
-    print("\n✗ Results differ")
-    print(f"Max diff: {(C_dequantized[:, :, 0] - C_ref_match).abs().max()}")
-    print(f"Mean diff: {(C_dequantized[:, :, 0] - C_ref_match).abs().mean()}")
-
-
-# Benchmark
-print("\n=== Benchmarking GEMM kernel ===")
-num_elements = sum([A_float.numel(), B_float.numel(), C.numel()])
-def benchmark_quant(callable, a_, b_, c_, a_scale_, b_scale_):
+# ── benchmark ────────────────────────────────────────────────────────────────
+def benchmark(callable, a_, b_, c_, sa_, sb_):
     avg_time_us = cute.testing.benchmark(
         callable,
-        kernel_arguments=cute.testing.JitArguments(a_, b_, c_, a_scale_, b_scale_),
+        kernel_arguments=cute.testing.JitArguments(a_, b_, c_, sa_, sb_),
         warmup_iterations=5,
         iterations=100,
     )
 
-    # Calculate metrics
-    # ----------------
-    dtype = a_.element_type
+    a_bytes      = M * K * (cutlass.Int8.width   // 8)
+    b_bytes      = N * K * (cutlass.Int8.width   // 8)
+    c_bytes      = M * N * (cutlass_torch.dtype(c_dtype).itemsize)
+    total_bytes  = a_bytes + b_bytes + c_bytes
+    total_ops    = 2 * M * N * K
 
-    # Calculate total bytes transferred:
-    # - 2 reads (A and B) + 1 write (C)
-    # - Each element is dtype.width bits
-    bytes_per_element = dtype.width // 8
-    total_bytes = num_elements * bytes_per_element
+    avg_time_s   = avg_time_us * 1e-6
+    bw_gbs       = (total_bytes / avg_time_s) / 1e9
+    tops         = (total_ops   / avg_time_s) / 1e12
 
-    # Calculate achieved bandwidth
-    achieved_bandwidth = total_bytes / (avg_time_us * 1000)  # GB/s
-    gtops = num_elements / (avg_time_us * 1000)  # GTOPS
+    peak_tops    = 624.0    # A100 INT8
+    peak_bw_gbs  = 2000.0   # A100 HBM
 
-    # Print results
-    # ------------
-    print(f"Performance Metrics:")
-    print(f"-------------------")
-    print(f"Kernel execution time: {avg_time_us:.4f} us")
-    print(f"Memory throughput: {achieved_bandwidth:.2f} GB/s")
-    print(f"GTOPS: {gtops:.2f}")
+    print(f"\nPerformance Metrics:")
+    print(f"  Shape:              M={M} N={N} K={K}")
+    print(f"  Time:               {avg_time_us:.2f} us")
+    print(f"  Compute:            {tops:.3f} TOPS  ({tops/peak_tops*100:.1f}% of {peak_tops} TOPS peak)")
+    print(f"  Bandwidth:          {bw_gbs:.1f} GB/s  ({bw_gbs/peak_bw_gbs*100:.1f}% of {peak_bw_gbs} GB/s peak)")
+    print(f"  Arithmetic intensity: {total_ops/total_bytes:.1f} FLOP/byte")
 
-benchmark_quant(compiled_gemm, mA, mB, mC, mAScale, mBScale)
+print("\n=== Benchmarking ===")
+benchmark(compiled_gemm, mA, mB, mC, mScaleA, mScaleB)

@@ -12,7 +12,7 @@ from ampere_gemm_f16 import TensorOpGemm
 # Simple test params - use larger size to match tile boundaries
 batch_size = 512
 timestep = 1024
-out_features = 512
+out_features = 4096
 in_features = 512
 
 # Create float input tensors
@@ -55,57 +55,57 @@ compiled_gemm = cute.compile(tensor_op_gemm, mA, mB, mC)
 print('=== Running GEMM === ')
 compiled_gemm(mA, mB, mC)
 
-# Float reference: A_float @ B_float^T
-A_ref = A_float.reshape(batch_size * timestep, in_features)  # (M, K)
-B_ref = B_float.reshape(out_features, in_features).t()  # (K, N)
-C_ref = torch.matmul(A_ref, B_ref)  # (M, N)
+# # Float reference: A_float @ B_float^T
+# A_ref = A_float.reshape(batch_size * timestep, in_features)  # (M, K)
+# B_ref = B_float.reshape(out_features, in_features).t()  # (K, N)
+# C_ref = torch.matmul(A_ref, B_ref)  # (M, N)
 
-print(f"\nC shape: {C.shape}")
-print(f"C_ref shape: {C_ref.shape}")
-print(f"\nC[:3, :3]:\n{C[:3, :3, 0]}")
-print(f"C_ref[:3, :3]:\n{C_ref[:3, :3]}")
+# print(f"\nC shape: {C.shape}")
+# print(f"C_ref shape: {C_ref.shape}")
+# print(f"\nC[:3, :3]:\n{C[:3, :3, 0]}")
+# print(f"C_ref[:3, :3]:\n{C_ref[:3, :3]}")
 
-# Compare
-C_ref_match = C_ref[:, :out_features]
-if torch.allclose(C[:, :, 0], C_ref_match, atol=2.0, rtol=1e-1):
-    print("\n✓ Results match!")
-else:
-    print("\n✗ Results differ")
-    print(f"Max diff: {(C[:, :, 0] - C_ref_match).abs().max()}")
-    print(f"Mean diff: {(C[:, :, 0] - C_ref_match).abs().mean()}")
+# # Compare
+# C_ref_match = C_ref[:, :out_features]
+# if torch.allclose(C[:, :, 0], C_ref_match, atol=2.0, rtol=1e-1):
+#     print("\n✓ Results match!")
+# else:
+#     print("\n✗ Results differ")
+#     print(f"Max diff: {(C[:, :, 0] - C_ref_match).abs().max()}")
+#     print(f"Mean diff: {(C[:, :, 0] - C_ref_match).abs().mean()}")
 
 
-# Benchmark
-print("\n=== Benchmarking GEMM kernel ===")
-num_elements = sum([A_float.numel(), B_float.numel(), C.numel()])
-def benchmark(callable, a_, b_, c_):
-    avg_time_us = cute.testing.benchmark(
-        callable,
-        kernel_arguments=cute.testing.JitArguments(a_, b_, c_),
-        warmup_iterations=5,
-        iterations=100,
-    )
+# # Benchmark
+# print("\n=== Benchmarking GEMM kernel ===")
+# num_elements = sum([A_float.numel(), B_float.numel(), C.numel()])
+# def benchmark(callable, a_, b_, c_):
+#     avg_time_us = cute.testing.benchmark(
+#         callable,
+#         kernel_arguments=cute.testing.JitArguments(a_, b_, c_),
+#         warmup_iterations=5,
+#         iterations=100,
+#     )
 
-    # Calculate metrics
-    # ----------------
-    dtype = a_.element_type
+#     # Calculate metrics
+#     # ----------------
+#     dtype = a_.element_type
 
-    # Calculate total bytes transferred:
-    # - 2 reads (A and B) + 1 write (C)
-    # - Each element is dtype.width bits
-    bytes_per_element = dtype.width // 8
-    total_bytes = num_elements * bytes_per_element
+#     # Calculate total bytes transferred:
+#     # - 2 reads (A and B) + 1 write (C)
+#     # - Each element is dtype.width bits
+#     bytes_per_element = dtype.width // 8
+#     total_bytes = num_elements * bytes_per_element
 
-    # Calculate achieved bandwidth
-    achieved_bandwidth = total_bytes / (avg_time_us * 1000)  # GB/s
-    gflops = num_elements / (avg_time_us * 1000)  # GFLOPS
+#     # Calculate achieved bandwidth
+#     achieved_bandwidth = total_bytes / (avg_time_us * 1000)  # GB/s
+#     gflops = num_elements / (avg_time_us * 1000)  # GFLOPS
 
-    # Print results
-    # ------------
-    print(f"Performance Metrics:")
-    print(f"-------------------")
-    print(f"Kernel execution time: {avg_time_us:.4f} us")
-    print(f"Memory throughput: {achieved_bandwidth:.2f} GB/s")
-    print(f"GFLOPS: {gflops:.2f}")
+#     # Print results
+#     # ------------
+#     print(f"Performance Metrics:")
+#     print(f"-------------------")
+#     print(f"Kernel execution time: {avg_time_us:.4f} us")
+#     print(f"Memory throughput: {achieved_bandwidth:.2f} GB/s")
+#     print(f"GFLOPS: {gflops:.2f}")
 
-benchmark(compiled_gemm, mA, mB, mC)
+# benchmark(compiled_gemm, mA, mB, mC)

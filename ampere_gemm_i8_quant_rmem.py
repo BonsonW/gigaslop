@@ -546,6 +546,62 @@ class TensorOpGemmI8:
             tCrC = tiled_mma.make_fragment_C(tCgC)
             tCrC.fill(0)
 
+            # ////////////////////////////////////////////////////////////////////////////////
+            # Load scales for quantization into registers, with appropriate broadcast dimensions
+            # ////////////////////////////////////////////////////////////////////////////////
+            num_vals  = cute.size(tCrC, mode=[0])
+            num_mma_m = cute.size(tCrC, mode=[1])
+            num_mma_n = cute.size(tCrC, mode=[2])
+            # Build broadcast layouts: scale_A broadcasts across N (stride-0 in N)
+            #                          scale_B broadcasts across M (stride-0 in M)
+            gScaleA_2d = cute.make_tensor(
+                gScaleA.iterator,
+                cute.make_layout((self.bM, self.bN), stride=(1, 0))
+            )
+            gScaleB_2d = cute.make_tensor(
+                gScaleB.iterator,
+                cute.make_layout((self.bM, self.bN), stride=(0, 1))
+            )
+            # Partition through the same MMA thread map as C — automatically correct
+            tCgScaleA = thr_mma.partition_C(gScaleA_2d)  # (MMA_VAL, MMA_M, MMA_N)
+            tCgScaleB = thr_mma.partition_C(gScaleB_2d)  # (MMA_VAL, MMA_M, MMA_N)
+            # Compact register storage: A only varies in M, B only varies in N
+            rScaleA = cute.make_rmem_tensor(
+                cute.make_layout(
+                    (num_vals, num_mma_m, num_mma_n),
+                    stride=(num_mma_m, 1, 0),   # stride-0 in N
+                ),
+                cutlass.Float32,
+            )
+            rScaleB = cute.make_rmem_tensor(
+                cute.make_layout(
+                    (num_vals, num_mma_m, num_mma_n),
+                    stride=(num_mma_n, 0, 1),   # stride-0 in M
+                ),
+                cutlass.Float32,
+            )
+
+            # Load only unique values — (num_vals * num_mma_m) + (num_vals * num_mma_n) loads
+            for i in cutlass.range(num_vals, unroll_full=True):
+                for m in cutlass.range(num_mma_m, unroll_full=True):
+                    rScaleA[i, m, 0] = tCgScaleA[i, m, 0].to(cutlass.Float32)
+            for i in cutlass.range(num_vals, unroll_full=True):
+                for n in cutlass.range(num_mma_n, unroll_full=True):
+                    rScaleB[i, 0, n] = tCgScaleB[i, 0, n].to(cutlass.Float32)
+
+            # Precompute combined scale — single multiply before mainloop
+            rScale = cute.make_rmem_tensor(
+                cute.make_layout(
+                    (num_vals, num_mma_m, num_mma_n),
+                    stride=(num_mma_m * num_mma_n, num_mma_n, 1),
+                ),
+                cutlass.Float32,
+            )
+            for i in cutlass.range(num_vals, unroll_full=True):
+                for m in cutlass.range(num_mma_m, unroll_full=True):
+                    for n in cutlass.range(num_mma_n, unroll_full=True):
+                        rScale[i, m, n] = rScaleA[i, m, 0] * rScaleB[i, 0, n]
+
             # tCgC has shape (MMA, MMA_M, MMA_N)
             # We need per-thread scale views with the same MMA_M / MMA_N extent
 
@@ -553,15 +609,15 @@ class TensorOpGemmI8:
             # tCgC.shape = (ValID, MMA_M, MMA_N)
             # The M-coord of each output element is in tCgC's M mode, same for N.
 
-            # Build identity tensors over the tile so we can read back coordinates
-            cC = cute.make_identity_tensor((self.bM, self.bN))
-            tCcC = thr_mma.partition_C(cC)   # (MMA, MMA_M, MMA_N) of (m,n) coord tuples
+            # # Build identity tensors over the tile so we can read back coordinates
+            # cC = cute.make_identity_tensor((self.bM, self.bN))
+            # tCcC = thr_mma.partition_C(cC)   # (MMA, MMA_M, MMA_N) of (m,n) coord tuples
 
-            # Now load scale values into register fragments matching tCrC's shape
-            # tCrC shape: (MMA_VAL, MMA_M, MMA_N)
-            num_vals = cute.size(tCrC, mode=[0])
-            num_mma_m = cute.size(tCrC, mode=[1])
-            num_mma_n = cute.size(tCrC, mode=[2])
+            # # Now load scale values into register fragments matching tCrC's shape
+            # # tCrC shape: (MMA_VAL, MMA_M, MMA_N)
+            # num_vals = cute.size(tCrC, mode=[0])
+            # num_mma_m = cute.size(tCrC, mode=[1])
+            # num_mma_n = cute.size(tCrC, mode=[2])
 
             # ///////////////////////////////////////////////////////////////////////////////
             # Copy Atom A/B retiling (shared memory -> registers)
@@ -682,21 +738,11 @@ class TensorOpGemmI8:
             # the run() function pads output tensors to tile boundaries.
             # ///////////////////////////////////////////////////////////////////////////////
             
-            # Cast accumulator to float for dequant multiply
+            # Epilogue — single fma per element, rScale already in registers
             tCrC_fp = cute.make_fragment_like(tCrC, cutlass.Float32)
-            for i in cutlass.range(num_vals, unroll_full=True):
-                for m in cutlass.range(num_mma_m, unroll_full=True):
-                    for n in cutlass.range(num_mma_n, unroll_full=True):
-                        # Coordinate of this register element in the CTA tile
-                        m_coord = tCcC[i, m, n][0]   # row within BLK_M
-                        n_coord = tCcC[i, m, n][1]   # col within BLK_N
+            for i in cutlass.range(cute.size(tCrC), unroll_full=True):
+                tCrC_fp[i] = tCrC[i].to(cutlass.Float32) * rScale[i]
 
-                        acc_val = tCrC[i, m, n].to(cutlass.Float32)
-                        sa = gScaleA[m_coord].to(cutlass.Float32)
-                        sb = gScaleB[n_coord].to(cutlass.Float32)
-                        tCrC_fp[i, m, n] = acc_val * sa * sb
-
-            # Apply any further epilogue op (bias, activation, etc.) then store
             tCrD = cute.make_fragment_like(tCrC_fp, self.c_dtype)
             tCrD[None] = epilogue_op(tCrC_fp.load()).to(self.c_dtype)
             cute.autovec_copy(tCrD, tCgC)
