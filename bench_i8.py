@@ -8,7 +8,7 @@ import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'tutorial'))
-from ampere_gemm_i8_dequant import TensorOpGemmI8
+from ampere_gemm_i8 import TensorOpGemmI8
 
 def quantize_tensor(t, dim=-1):
     """Quantize float tensor to int8 with optional per-tensor scaling.
@@ -34,27 +34,18 @@ timestep = 1024
 out_features = 512
 in_features = 512
 
-# Create float input tensors
-A_float = torch.randn((batch_size, timestep, in_features), dtype=torch.float16, device='cuda').reshape(batch_size * timestep, in_features)
-B_float = torch.randn((out_features, in_features), dtype=torch.float16, device='cuda').reshape(out_features, in_features)
-print(f"A_float shape: {A_float.shape}, B_float shape: {B_float.shape}")
-
-# Quantize to int8
-A_int8, A_scale = quantize_tensor(A_float, dim=-1)
-B_int8, B_scale = quantize_tensor(B_float, dim=-1)
+# Create int8 input tensors
+A_int8 = torch.randint(-128, 127, (batch_size, timestep, in_features), dtype=torch.int8, device='cuda').reshape(batch_size * timestep, in_features)
+B_int8 = torch.randint(-128, 127, (out_features, in_features), dtype=torch.int8, device='cuda').reshape(out_features, in_features)
+print(f"A_int8 shape: {A_int8.shape}, B_int8 shape: {B_int8.shape}")
 
 A_int8 = A_int8.reshape(batch_size * timestep, in_features, 1)
 B_int8 = B_int8.reshape(out_features, in_features, 1)
 
-A_scale = A_scale.reshape(A_scale.size(0), 1)
-B_scale = B_scale.reshape(B_scale.size(0), 1)
-
-# print(f"A_scale: {A_scale}, B_scale: {B_scale}")
 print(f"A_int8 shape: {A_int8.shape}, B_int8 shape: {B_int8.shape}")
-print(f"A_scale shape: {A_scale.shape}, B_scale shape: {B_scale.shape}")
 
 # Create output buffer
-C = torch.zeros((batch_size * timestep, out_features, 1), dtype=torch.float16, device='cuda')
+C = torch.zeros((batch_size * timestep, out_features, 1), dtype=torch.int32, device='cuda')
 
 print(f"C shape: {C.shape}")
 
@@ -63,57 +54,50 @@ mA = from_dlpack(A_int8, assumed_align=16)
 mB = from_dlpack(B_int8, assumed_align=16)
 mC = from_dlpack(C, assumed_align=16)
 
-mAScale = from_dlpack(A_scale, assumed_align=16)
-mBScale = from_dlpack(B_scale, assumed_align=16)
-
 # Setup and compile kernel
 tensor_op_gemm = TensorOpGemmI8(
     cutlass.Int8,
     cutlass.Int8,
-    cutlass.Float16,
+    cutlass.Int32,
     cutlass.Int32,
     atom_layout_mnk=(2, 2, 1),
-    use_k32=False,
+    use_k32=True,
     bm=128,
 )
 
 print('=== Compiling ampere_gemm kernel ===')
-# compiled_gemm = cute.compile(tensor_op_gemm, mA, mB, mC)
-compiled_gemm = cute.compile(tensor_op_gemm, mA, mB, mC, mAScale, mBScale)
+compiled_gemm = cute.compile(tensor_op_gemm, mA, mB, mC)
 
-print('=== Running GEMM === ')
-compiled_gemm(mA, mB, mC, mAScale, mBScale)
+# print('=== Running GEMM === ')
+# compiled_gemm(mA, mB, mC)
 
-# Dequantize output: C_int32 * A_scale * B_scale
-C_dequantized = C
+# # Float reference: A_float @ B_float^T
+# A_ref = A_int8.reshape(batch_size * timestep, in_features)  # (M, K)
+# B_ref = B_int8.reshape(out_features, in_features).t()  # (K, N)
+# C_ref = torch.matmul(A_ref, B_ref)  # (M, N)
 
-# Float reference: A_float @ B_float^T
-A_ref = A_float.reshape(batch_size * timestep, in_features)  # (M, K)
-B_ref = B_float.reshape(out_features, in_features).t()  # (K, N)
-C_ref = torch.matmul(A_ref, B_ref)  # (M, N)
+# print(f"\nC_dequantized shape: {C_dequantized.shape}")
+# print(f"C_ref shape: {C_ref.shape}")
+# print(f"\nC_dequantized[:3, :3]:\n{C_dequantized[:3, :3, 0]}")
+# print(f"C_ref[:3, :3]:\n{C_ref[:3, :3]}")
 
-print(f"\nC_dequantized shape: {C_dequantized.shape}")
-print(f"C_ref shape: {C_ref.shape}")
-print(f"\nC_dequantized[:3, :3]:\n{C_dequantized[:3, :3, 0]}")
-print(f"C_ref[:3, :3]:\n{C_ref[:3, :3]}")
-
-# Compare
-C_ref_match = C_ref[:, :out_features]
-if torch.allclose(C_dequantized[:, :, 0], C_ref_match, atol=2.0, rtol=1e-1):
-    print("\n✓ Results match!")
-else:
-    print("\n✗ Results differ")
-    print(f"Max diff: {(C_dequantized[:, :, 0] - C_ref_match).abs().max()}")
-    print(f"Mean diff: {(C_dequantized[:, :, 0] - C_ref_match).abs().mean()}")
+# # Compare
+# C_ref_match = C_ref[:, :out_features]
+# if torch.allclose(C_dequantized[:, :, 0], C_ref_match, atol=2.0, rtol=1e-1):
+#     print("\n✓ Results match!")
+# else:
+#     print("\n✗ Results differ")
+#     print(f"Max diff: {(C_dequantized[:, :, 0] - C_ref_match).abs().max()}")
+#     print(f"Mean diff: {(C_dequantized[:, :, 0] - C_ref_match).abs().mean()}")
 
 
 # Benchmark
 print("\n=== Benchmarking GEMM kernel ===")
-num_elements = sum([A_float.numel(), B_float.numel(), C.numel()])
-def benchmark_quant(callable, a_, b_, c_, a_scale_, b_scale_):
+num_elements = sum([A_int8.numel(), B_int8.numel(), C.numel()])
+def benchmark(callable, a_, b_, c_):
     avg_time_us = cute.testing.benchmark(
         callable,
-        kernel_arguments=cute.testing.JitArguments(a_, b_, c_, a_scale_, b_scale_),
+        kernel_arguments=cute.testing.JitArguments(a_, b_, c_),
         warmup_iterations=5,
         iterations=100,
     )
@@ -139,5 +123,5 @@ def benchmark_quant(callable, a_, b_, c_, a_scale_, b_scale_):
     print(f"Kernel execution time: {avg_time_us:.4f} us")
     print(f"Memory throughput: {achieved_bandwidth:.2f} GB/s")
     print(f"GTOPS: {gtops:.2f}")
-
-benchmark_quant(compiled_gemm, mA, mB, mC, mAScale, mBScale)
+    
+benchmark(compiled_gemm, mA, mB, mC)
