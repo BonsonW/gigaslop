@@ -801,6 +801,138 @@ class TensorOpGemmI8:
         new_j = (i % f) + (j * f)
         return (new_i, new_j)
 
+# A(M,K) K-major, B(N,K) K-major, C(M,N) N-major
+def create_and_permute_tensor(l, mode0, mode1, is_mode0_major, dtype):
+    import cutlass.torch as cutlass_torch
+
+    shape = (l, mode1, mode0) if is_mode0_major else (l, mode0, mode1)
+    permute_order = (2, 1, 0) if is_mode0_major else (1, 2, 0)
+    torch_dtype = cutlass_torch.dtype(dtype)
+    if dtype == cutlass.Float16 or dtype.signed:
+        torch_tensor = torch.randint(-2, 3, shape, dtype=torch_dtype)
+    else:
+        torch_tensor = torch.randint(0, 5, shape, dtype=torch_dtype)
+    torch_tensor = torch_tensor.permute(permute_order).cuda()
+    cute_tensor = (
+        from_dlpack(torch_tensor, assumed_align=16)
+        .mark_layout_dynamic(leading_dim=(1 if not is_mode0_major else 0))
+        .mark_compact_shape_dynamic(
+            mode=(1 if not is_mode0_major else 0),
+            stride_order=(2, 0, 1) if not is_mode0_major else (2, 1, 0),
+            divisibility=(128 // dtype.width),
+        )
+    )
+    return cute_tensor, torch_tensor
+
+def export_tensor_op_gemm_i8(
+    a_dtype: Type[cutlass.Numeric],
+    b_dtype: Type[cutlass.Numeric],
+    c_dtype: Type[cutlass.Numeric],
+    acc_dtype: Type[cutlass.Numeric],
+    atom_layout_mnk: Tuple[int, int, int],
+    file_path: str = "./artifacts",
+    file_name: str = "tensor_op_gemm_i8",
+    function_prefix: str = "tensor_op_gemm_i8",
+    use_k32: bool = False,
+    bm: int = 128,
+    bn: int = 128,
+    num_stages: int = 3,
+    m_size: int = 128,
+    n_size: int = 128,
+    k_size: int = 128,
+    l_size: int = 1,
+) -> None:
+    """
+    Export TensorOpGemmI8 kernel to C code with custom parameters.
+    
+    This creates a specialized GEMM kernel compiled for the given parameters.
+    Fake (symbolic) tensor shapes are used during AOT compilation, allowing
+    dynamic dimensions at runtime.
+    
+    Args:
+        a_dtype: Input matrix A data type (Int8, Uint8)
+        b_dtype: Input matrix B data type (Int8, Uint8)
+        c_dtype: Output matrix C data type (Int32)
+        acc_dtype: Accumulator data type (Int32)
+        atom_layout_mnk: Atom layout tuple (atom_m, atom_n, atom_k)
+        file_path: Directory to export C files to
+        file_name: Base name for exported files
+        function_prefix: Prefix for exported C functions
+        use_k32: Whether to use K=32 MMA instruction instead of K=16
+        bm: Tile size M dimension (default: 128)
+        bn: Tile size N dimension (default: 128)
+        num_stages: Pipeline stages (default: 3)
+        m_size: Symbolic M dimension size (default: 128)
+        n_size: Symbolic N dimension size (default: 128)
+        k_size: Symbolic K dimension size (default: 128)
+        l_size: Batch dimension size (default: 1)
+    
+    Example:
+        >>> export_tensor_op_gemm_i8(
+        ...     a_dtype=cutlass.Int8,
+        ...     b_dtype=cutlass.Int8,
+        ...     c_dtype=cutlass.Int32,
+        ...     acc_dtype=cutlass.Int32,
+        ...     atom_layout_mnk=(2, 2, 1),
+        ...     file_path="./artifacts",
+        ...     file_name="my_gemm_i8",
+        ... )
+    """
+    # Build representative compile inputs with the same tensor construction path
+    # used by the runtime benchmark. These become the export trace inputs.
+    fake_a, _ = create_and_permute_tensor(l_size, m_size, k_size, False, a_dtype)
+    fake_b, _ = create_and_permute_tensor(l_size, n_size, k_size, False, b_dtype)
+    fake_c, _ = create_and_permute_tensor(l_size, m_size, n_size, False, c_dtype)
+    fake_scale_a = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32,
+        (m_size, l_size),
+        assumed_align=16,
+    )
+    fake_scale_b = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32,
+        (n_size, l_size),
+        assumed_align=16,
+    )
+    
+    # Instantiate the GEMM kernel with the specified parameters
+    tensor_op_gemm = TensorOpGemmI8(
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        c_dtype=c_dtype,
+        acc_dtype=acc_dtype,
+        atom_layout_mnk=atom_layout_mnk,
+        use_k32=use_k32,
+        bm=bm,
+        bn=bn,
+        num_stages=num_stages,
+    )
+    
+    # Compile the kernel with fake tensors
+    print(f"Compiling TensorOpGemmI8 kernel...")
+    print(f"  A dtype: {a_dtype}, B dtype: {b_dtype}")
+    print(f"  C dtype: {c_dtype}, Acc dtype: {acc_dtype}")
+    print(f"  Tile: {bm}x{bn}x64, Atom layout: {atom_layout_mnk}")
+    print(f"  Use K32: {use_k32}, Stages: {num_stages}")
+    
+    compiled_gemm = cute.compile(
+        tensor_op_gemm,
+        fake_a,
+        fake_b,
+        fake_c,
+        fake_scale_a,
+        fake_scale_b,
+    )
+    
+    # Export to C code
+    print(f"Exporting to {file_path}/{file_name}...")
+    compiled_gemm.export_to_c(
+        file_path=file_path,
+        file_name=file_name,
+        function_prefix=function_prefix,
+    )
+    print(f"Export complete!")
+
+
 @torch.inference_mode()
 def gemm_ref(
     A,
@@ -880,27 +1012,6 @@ def run(
     print(f"Iterations: {iterations}")
     print(f"Skip reference checking: {skip_ref_check}")
     print(f"Use cold L2: {use_cold_l2}")
-
-    # A(M,K) K-major, B(N,K) K-major, C(M,N) N-major
-    def create_and_permute_tensor(l, mode0, mode1, is_mode0_major, dtype):
-        shape = (l, mode1, mode0) if is_mode0_major else (l, mode0, mode1)
-        permute_order = (2, 1, 0) if is_mode0_major else (1, 2, 0)
-        torch_dtype = cutlass_torch.dtype(dtype)
-        if dtype.signed:
-            torch_tensor = torch.randint(-2, 3, shape, dtype=torch_dtype)
-        else:
-            torch_tensor = torch.randint(0, 5, shape, dtype=torch_dtype)
-        torch_tensor = torch_tensor.permute(permute_order).cuda()
-        cute_tensor = (
-            from_dlpack(torch_tensor, assumed_align=16)
-            .mark_layout_dynamic(leading_dim=(1 if not is_mode0_major else 0))
-            .mark_compact_shape_dynamic(
-                mode=(1 if not is_mode0_major else 0),
-                stride_order=(2, 0, 1) if not is_mode0_major else (2, 1, 0),
-                divisibility=(128 // dtype.width),
-            )
-        )
-        return cute_tensor, torch_tensor
 
     # Create padded tensors; zero padding ensures MMA gets zeros for OOB elements.
     # Tensor shape after permute is always (mode0, mode1, L); majorness only
