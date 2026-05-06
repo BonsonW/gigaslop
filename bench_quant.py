@@ -9,6 +9,7 @@ from cutlass.cute.runtime import from_dlpack
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'tutorial'))
 from ampere_gemm_i8_dequant import TensorOpGemmI8
+from ampere_gemm_f16 import TensorOpGemm
 
 def quantize_tensor(t, dim=-1):
     """Quantize float tensor to int8 with optional per-tensor scaling.
@@ -110,7 +111,7 @@ else:
 # Benchmark
 print("\n=== Benchmarking GEMM kernel ===")
 num_elements = sum([A_float.numel(), B_float.numel(), C.numel()])
-def benchmark(callable, a_, b_, c_, a_scale_, b_scale_):
+def benchmark_quant(callable, a_, b_, c_, a_scale_, b_scale_):
     avg_time_us = cute.testing.benchmark(
         callable,
         kernel_arguments=cute.testing.JitArguments(a_, b_, c_, a_scale_, b_scale_),
@@ -130,6 +131,7 @@ def benchmark(callable, a_, b_, c_, a_scale_, b_scale_):
 
     # Calculate achieved bandwidth
     achieved_bandwidth = total_bytes / (avg_time_us * 1000)  # GB/s
+    gtops = num_elements / (avg_time_us * 1000)  # GTOPS
 
     # Print results
     # ------------
@@ -137,5 +139,6 @@ def benchmark(callable, a_, b_, c_, a_scale_, b_scale_):
     print(f"-------------------")
     print(f"Kernel execution time: {avg_time_us:.4f} us")
     print(f"Memory throughput: {achieved_bandwidth:.2f} GB/s")
-
-benchmark(compiled_gemm, mA, mB, mC, mAScale, mBScale)
+    print(f"GTOPS: {gtops:.2f}")
+    
+benchmark_quant(compiled_gemm, mA, mB, mC, mAScale, mBScale)
