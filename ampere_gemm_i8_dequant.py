@@ -228,6 +228,8 @@ class TensorOpGemmI8:
         mA: cute.Tensor,
         mB: cute.Tensor,
         mC: cute.Tensor,
+        mScaleA: cute.Tensor,   # shape (M,) or (M, L), float32
+        mScaleB: cute.Tensor,   # shape (N,) or (N, L), float32
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
         self.a_major_mode = utils.LayoutEnum.from_tensor(mA)
@@ -314,6 +316,7 @@ class TensorOpGemmI8:
             mA,
             mB,
             mC,
+            mScaleA, mScaleB,
             sA_layout,
             sB_layout,
             tiled_copy_A,
@@ -333,6 +336,8 @@ class TensorOpGemmI8:
         mA: cute.Tensor,
         mB: cute.Tensor,
         mC: cute.Tensor,
+        mScaleA: cute.Tensor,   # shape (M,) or (M, L), float32
+        mScaleB: cute.Tensor,   # shape (N,) or (N, L), float32
         sA_layout: cute.ComposedLayout,
         sB_layout: cute.ComposedLayout,
         tiled_copy_A: cute.TiledCopy,
@@ -375,6 +380,19 @@ class TensorOpGemmI8:
                 tiler=self.cta_tiler,
                 coord=tiler_coord,
                 proj=(1, 1, None),
+            )
+
+            # gScaleA: (BLK_M,)  — the M-slice this CTA owns
+            gScaleA = cute.local_tile(
+                mScaleA[None, bidz],
+                tiler=(self.bM,),
+                coord=(offset_tile_x,),
+            )
+            # gScaleB: (BLK_N,)
+            gScaleB = cute.local_tile(
+                mScaleB[None, bidz],
+                tiler=(self.bN,),
+                coord=(offset_tile_y,),
             )
 
             # Make the first k-tiles irregular instead of last, so we handle
@@ -526,6 +544,23 @@ class TensorOpGemmI8:
             tCrC = tiled_mma.make_fragment_C(tCgC)
             tCrC.fill(0)
 
+            # tCgC has shape (MMA, MMA_M, MMA_N)
+            # We need per-thread scale views with the same MMA_M / MMA_N extent
+
+            # Partition the 1D scale vectors using the C partitioning as a guide.
+            # tCgC.shape = (ValID, MMA_M, MMA_N)
+            # The M-coord of each output element is in tCgC's M mode, same for N.
+
+            # Build identity tensors over the tile so we can read back coordinates
+            cC = cute.make_identity_tensor((self.bM, self.bN))
+            tCcC = thr_mma.partition_C(cC)   # (MMA, MMA_M, MMA_N) of (m,n) coord tuples
+
+            # Now load scale values into register fragments matching tCrC's shape
+            # tCrC shape: (MMA_VAL, MMA_M, MMA_N)
+            num_vals = cute.size(tCrC, mode=[0])
+            num_mma_m = cute.size(tCrC, mode=[1])
+            num_mma_n = cute.size(tCrC, mode=[2])
+
             # ///////////////////////////////////////////////////////////////////////////////
             # Copy Atom A/B retiling (shared memory -> registers)
             # ///////////////////////////////////////////////////////////////////////////////
@@ -644,9 +679,26 @@ class TensorOpGemmI8:
             # (128x128x4B) that would limit occupancy to 1 CTA/SM. Instead,
             # the run() function pads output tensors to tile boundaries.
             # ///////////////////////////////////////////////////////////////////////////////
-            tCrD = cute.make_fragment_like(tCrC, self.c_dtype)
-            tCrD[None] = epilogue_op(tCrC.load()).to(self.c_dtype)
+            
+            # Cast accumulator to float for dequant multiply
+            tCrC_fp = cute.make_fragment_like(tCrC, cutlass.Float32)
+            for i in cutlass.range(num_vals, unroll_full=True):
+                for m in cutlass.range(num_mma_m, unroll_full=True):
+                    for n in cutlass.range(num_mma_n, unroll_full=True):
+                        # Coordinate of this register element in the CTA tile
+                        m_coord = tCcC[i, m, n][0]   # row within BLK_M
+                        n_coord = tCcC[i, m, n][1]   # col within BLK_N
+
+                        acc_val = tCrC[i, m, n].to(cutlass.Float32)
+                        sa = gScaleA[m_coord].to(cutlass.Float32)
+                        sb = gScaleB[n_coord].to(cutlass.Float32)
+                        tCrC_fp[i, m, n] = acc_val * sa * sb
+
+            # Apply any further epilogue op (bias, activation, etc.) then store
+            tCrD = cute.make_fragment_like(tCrC_fp, self.c_dtype)
+            tCrD[None] = epilogue_op(tCrC_fp.load()).to(self.c_dtype)
             cute.autovec_copy(tCrD, tCgC)
+
         return
 
     def _make_smem_layout_AB(self, dtype, major_mode, copy_bits, smem_tiler):
