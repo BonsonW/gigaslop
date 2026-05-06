@@ -8,7 +8,7 @@ import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'tutorial'))
-from ampere_gemm_i8_quant import TensorOpGemmI8
+from ampere_gemm_i8_quant_rmem import TensorOpGemmI8
 
 verify_correctness = False
 

@@ -15,6 +15,10 @@ timestep = 1024
 out_features = 4096
 in_features = 512
 
+M = batch_size * timestep
+K = in_features
+N = out_features
+
 # Create float input tensors
 A_float = torch.randn((batch_size, timestep, in_features), dtype=torch.float16, device='cuda').reshape(batch_size * timestep, in_features)
 B_float = torch.randn((out_features, in_features), dtype=torch.float16, device='cuda').reshape(out_features, in_features)
@@ -75,37 +79,33 @@ compiled_gemm(mA, mB, mC)
 #     print(f"Mean diff: {(C[:, :, 0] - C_ref_match).abs().mean()}")
 
 
-# # Benchmark
-# print("\n=== Benchmarking GEMM kernel ===")
-# num_elements = sum([A_float.numel(), B_float.numel(), C.numel()])
-# def benchmark(callable, a_, b_, c_):
-#     avg_time_us = cute.testing.benchmark(
-#         callable,
-#         kernel_arguments=cute.testing.JitArguments(a_, b_, c_),
-#         warmup_iterations=5,
-#         iterations=100,
-#     )
+# Benchmark
+print("\n=== Benchmarking GEMM kernel ===")
+def benchmark(callable, a_, b_, c_):
+    avg_time_us = cute.testing.benchmark(
+        callable,
+        kernel_arguments=cute.testing.JitArguments(a_, b_, c_),
+        warmup_iterations=5,
+        iterations=100,
+    )
 
-#     # Calculate metrics
-#     # ----------------
-#     dtype = a_.element_type
+    a_bytes     = M * K * (cutlass.Float16.width // 8)
+    b_bytes     = N * K * (cutlass.Float16.width // 8)
+    c_bytes     = M * N * 2   # float16 = 2 bytes
+    total_bytes = a_bytes + b_bytes + c_bytes
+    total_ops   = 2 * M * N * K
 
-#     # Calculate total bytes transferred:
-#     # - 2 reads (A and B) + 1 write (C)
-#     # - Each element is dtype.width bits
-#     bytes_per_element = dtype.width // 8
-#     total_bytes = num_elements * bytes_per_element
+    avg_time_s          = avg_time_us * 1e-6
+    achieved_bw_gbs     = (total_bytes / avg_time_s) / 1e9
+    tops                = (total_ops   / avg_time_s) / 1e12
 
-#     # Calculate achieved bandwidth
-#     achieved_bandwidth = total_bytes / (avg_time_us * 1000)  # GB/s
-#     gflops = num_elements / (avg_time_us * 1000)  # GFLOPS
+    peak_tops    = 624.0    # A100 INT8 tensor core peak
+    peak_bw_gbs  = 2000.0   # A100 HBM peak
 
-#     # Print results
-#     # ------------
-#     print(f"Performance Metrics:")
-#     print(f"-------------------")
-#     print(f"Kernel execution time: {avg_time_us:.4f} us")
-#     print(f"Memory throughput: {achieved_bandwidth:.2f} GB/s")
-#     print(f"GFLOPS: {gflops:.2f}")
-
-# benchmark(compiled_gemm, mA, mB, mC)
+    print(f"Performance Metrics:")
+    print(f"  Matrix shape:         M={M}, N={N}, K={K}")
+    print(f"  Execution time:       {avg_time_us:.2f} us")
+    print(f"  Compute:              {tops:.3f} FLOPS  ({tops/peak_tops*100:.1f}% of {peak_tops} FLOPS peak)")
+    print(f"  Bandwidth:            {achieved_bw_gbs:.1f} GB/s  ({achieved_bw_gbs/peak_bw_gbs*100:.1f}% of {peak_bw_gbs} GB/s peak)")
+    print(f"  Arithmetic intensity: {total_ops/total_bytes:.1f} FLOP/byte")
+benchmark(compiled_gemm, mA, mB, mC)
