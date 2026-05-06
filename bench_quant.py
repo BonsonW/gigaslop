@@ -8,7 +8,7 @@ import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'tutorial'))
-from ampere_gemm_i8_dequant import TensorOpGemmI8
+from ampere_gemm_i8_quant import TensorOpGemmI8
 
 def quantize_tensor(t, dim=-1):
     """Quantize float tensor to int8 with optional per-tensor scaling.
