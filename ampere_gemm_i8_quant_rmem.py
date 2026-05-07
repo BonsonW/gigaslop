@@ -589,7 +589,7 @@ class TensorOpGemmI8:
                 for n in cutlass.range(num_mma_n, unroll_full=True):
                     rScaleB[i, 0, n] = tCgScaleB[i, 0, n].to(cutlass.Float32)
 
-            # Precompute combined scale — single multiply before mainloop
+            # Precompute combined scale
             rScale = cute.make_rmem_tensor(
                 cute.make_layout(
                     (num_vals, num_mma_m, num_mma_n),
@@ -601,23 +601,6 @@ class TensorOpGemmI8:
                 for m in cutlass.range(num_mma_m, unroll_full=True):
                     for n in cutlass.range(num_mma_n, unroll_full=True):
                         rScale[i, m, n] = rScaleA[i, m, 0] * rScaleB[i, 0, n]
-
-            # tCgC has shape (MMA, MMA_M, MMA_N)
-            # We need per-thread scale views with the same MMA_M / MMA_N extent
-
-            # Partition the 1D scale vectors using the C partitioning as a guide.
-            # tCgC.shape = (ValID, MMA_M, MMA_N)
-            # The M-coord of each output element is in tCgC's M mode, same for N.
-
-            # # Build identity tensors over the tile so we can read back coordinates
-            # cC = cute.make_identity_tensor((self.bM, self.bN))
-            # tCcC = thr_mma.partition_C(cC)   # (MMA, MMA_M, MMA_N) of (m,n) coord tuples
-
-            # # Now load scale values into register fragments matching tCrC's shape
-            # # tCrC shape: (MMA_VAL, MMA_M, MMA_N)
-            # num_vals = cute.size(tCrC, mode=[0])
-            # num_mma_m = cute.size(tCrC, mode=[1])
-            # num_mma_n = cute.size(tCrC, mode=[2])
 
             # ///////////////////////////////////////////////////////////////////////////////
             # Copy Atom A/B retiling (shared memory -> registers)
@@ -737,12 +720,13 @@ class TensorOpGemmI8:
             # (128x128x4B) that would limit occupancy to 1 CTA/SM. Instead,
             # the run() function pads output tensors to tile boundaries.
             # ///////////////////////////////////////////////////////////////////////////////
-            
-            # Epilogue — single fma per element, rScale already in registers
+
+            # Apply scale
             tCrC_fp = cute.make_fragment_like(tCrC, cutlass.Float32)
             for i in cutlass.range(cute.size(tCrC), unroll_full=True):
                 tCrC_fp[i] = tCrC[i].to(cutlass.Float32) * rScale[i]
 
+            # Apply user-defined epilogue operator and store to global memory
             tCrD = cute.make_fragment_like(tCrC_fp, self.c_dtype)
             tCrD[None] = epilogue_op(tCrC_fp.load()).to(self.c_dtype)
             cute.autovec_copy(tCrD, tCgC)
