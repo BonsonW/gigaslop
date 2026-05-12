@@ -2,3 +2,6 @@ artifacts/*
 pyvenv/
 notes.sh
 *__pycache__/
+
+FlyDSL
+llvm-project

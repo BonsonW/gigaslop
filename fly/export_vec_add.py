@@ -1,0 +1,269 @@
+"""Export vectorAddKernel to a self-contained C header with embedded HSACO.
+
+Run with:
+    python export_vec_add.py
+
+Outputs:
+    artifacts/vec_add.h   — C header with embedded HSACO + HIP load/launch helpers
+"""
+import os
+import sys
+
+# Disable disk cache so the artifact is always freshly compiled and
+# accessible in _mem_cache after the first call.
+os.environ.setdefault("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
+
+import torch
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+
+
+# ── Kernel definition (mirrors fly_vec_add.py) ──────────────────────────────
+
+@flyc.kernel
+def vectorAddKernel(
+    A: fx.Tensor, B: fx.Tensor, C: fx.Tensor,
+    block_dim: fx.Constexpr[int],
+    n: fx.Int32,
+):
+    bid = fx.block_idx.x
+    tid = fx.thread_idx.x
+
+    # Bounds check: skip threads whose global index >= n
+    bid_i32 = fx.arith.index_cast(fx.T.i32(), bid)
+    tid_i32 = fx.arith.index_cast(fx.T.i32(), tid)
+    blk_i32 = fx.arith.constant(block_dim, type=fx.T.i32())
+    global_i = fx.arith.addi(fx.arith.muli(bid_i32, blk_i32), tid_i32)
+    in_bounds = fx.arith.cmpi(fx.arith.CmpIPredicate.slt, global_i, n)
+
+    if in_bounds:
+        tA = fx.logical_divide(A, fx.make_layout(block_dim, 1))
+        tB = fx.logical_divide(B, fx.make_layout(block_dim, 1))
+        tC = fx.logical_divide(C, fx.make_layout(block_dim, 1))
+
+        tA = fx.slice(tA, (None, bid))
+        tB = fx.slice(tB, (None, bid))
+        tC = fx.slice(tC, (None, bid))
+
+        tA = fx.logical_divide(tA, fx.make_layout(1, 1))
+        tB = fx.logical_divide(tB, fx.make_layout(1, 1))
+        tC = fx.logical_divide(tC, fx.make_layout(1, 1))
+
+        RABTy = fx.MemRefType.get(fx.T.f32(), fx.LayoutType.get(1, 1),
+                                  fx.AddressSpace.Register)
+        copyAtom = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
+        rA = fx.memref_alloca(RABTy, fx.make_layout(1, 1))
+        rB = fx.memref_alloca(RABTy, fx.make_layout(1, 1))
+        rC = fx.memref_alloca(RABTy, fx.make_layout(1, 1))
+
+        fx.copy_atom_call(copyAtom, fx.slice(tA, (None, tid)), rA)
+        fx.copy_atom_call(copyAtom, fx.slice(tB, (None, tid)), rB)
+
+        vC = fx.arith.addf(fx.memref_load_vec(rA), fx.memref_load_vec(rB))
+        fx.memref_store_vec(vC, rC)
+        fx.copy_atom_call(copyAtom, rC, fx.slice(tC, (None, tid)))
+
+
+@flyc.jit
+def vectorAdd(
+    A: fx.Tensor, B: fx.Tensor, C: fx.Tensor,
+    n: fx.Int32,
+    const_n: fx.Constexpr[int],
+    stream: fx.Stream = fx.Stream(None),
+):
+    block_dim = 64
+    grid_x = (n + block_dim - 1) // block_dim
+    vectorAddKernel(A, B, C, block_dim, n).launch(
+        grid=(grid_x, 1, 1), block=[block_dim, 1, 1], stream=stream,
+    )
+
+
+# ── Compilation ──────────────────────────────────────────────────────────────
+
+def _compile_and_get_ir():
+    n = 128
+    A = torch.zeros(n, dtype=torch.float32).cuda()
+    B = torch.zeros(n, dtype=torch.float32).cuda()
+    C = torch.zeros(n, dtype=torch.float32).cuda()
+    stream = torch.cuda.current_stream()
+    vectorAdd(A, B, C, n, n, stream=stream)
+    torch.cuda.synchronize()
+
+    artifacts = list(vectorAdd._mem_cache.values())
+    if not artifacts:
+        raise RuntimeError("_mem_cache is empty after compilation")
+    return artifacts[0]._ir_text
+
+
+# ── MLIR string decoding ──────────────────────────────────────────────────────
+
+def _decode_mlir_bin(ir_text: str, start: int) -> bytes:
+    """Find 'bin = "...' at or after *start* and return the decoded bytes."""
+    marker = 'bin = "'
+    pos = ir_text.find(marker, start)
+    if pos == -1:
+        raise ValueError("'bin = \"' not found in IR text")
+    i = pos + len(marker)
+    result = bytearray()
+    while i < len(ir_text):
+        c = ir_text[i]
+        if c == '\\':
+            nxt = ir_text[i + 1]
+            if nxt == '\\':
+                result.append(ord('\\'))
+                i += 2
+            elif nxt == '"':
+                result.append(ord('"'))
+                i += 2
+            else:
+                # \XX hex escape (MLIR standard for binary data)
+                result.append(int(ir_text[i + 1: i + 3], 16))
+                i += 3
+        elif c == '"':
+            break
+        else:
+            result.append(ord(c))
+            i += 1
+    return bytes(result)
+
+
+def _extract_hsaco(ir_text: str, prefer_no_wave64: bool = True) -> bytes:
+    """Extract HSACO ELF from a gpu.binary attribute in *ir_text*.
+
+    There are two compiled objects in the binary: a wave64 variant and a
+    wave32/no_wave64 variant.  We prefer wave32 for RDNA4 (gfx1201).
+    """
+    if prefer_no_wave64:
+        anchor = ir_text.find("no_wave64")
+        if anchor == -1:
+            print("Warning: no_wave64 variant not found, using first object")
+            anchor = 0
+    else:
+        anchor = 0
+    return _decode_mlir_bin(ir_text, anchor)
+
+
+# ── C header generation ───────────────────────────────────────────────────────
+
+_HEADER_TEMPLATE = """\
+/* Auto-generated by export_vec_add.py — do not edit.
+ *
+ * HSACO ELF for vectorAddKernel_0 (gfx1201, wave32/RDNA4).
+ * Computes:  C[i] = A[i] + B[i]  for i in [0, n).
+ * Grid:   ceil(n / 64) x 1 x 1
+ * Block:  64 x 1 x 1
+ *
+ * Build the C++ driver:
+ *   hipcc -o main_vec_add main_vec_add.cpp
+ */
+#pragma once
+#include <hip/hip_runtime.h>
+#include <stdint.h>
+#include <stdio.h>
+
+/* ── Embedded HSACO binary ({size} bytes) ── */
+static const uint8_t vec_add_hsaco[] = {{
+{hex_array}
+}};
+static const size_t vec_add_hsaco_size = {size}UL;
+
+/* ── Module handle ── */
+typedef struct {{
+    hipModule_t   module;
+    hipFunction_t func;
+}} vec_add_Module_t;
+
+/* Load the HSACO into the current HIP device context.
+ * Returns 0 on success, non-zero HIP error code otherwise. */
+static inline int vec_add_Module_Load(vec_add_Module_t *m) {{
+    hipError_t err;
+    err = hipModuleLoadData(&m->module, vec_add_hsaco);
+    if (err != hipSuccess) {{
+        fprintf(stderr, "vec_add: hipModuleLoadData failed: %s\\n",
+                hipGetErrorString(err));
+        return (int)err;
+    }}
+    err = hipModuleGetFunction(&m->func, m->module, "vectorAddKernel_0");
+    if (err != hipSuccess) {{
+        fprintf(stderr, "vec_add: hipModuleGetFunction failed: %s\\n",
+                hipGetErrorString(err));
+        (void)hipModuleUnload(m->module);
+        return (int)err;
+    }}
+    return 0;
+}}
+
+static inline void vec_add_Module_Unload(vec_add_Module_t *m) {{
+    if (m->module) (void)hipModuleUnload(m->module);
+    m->module = NULL;
+    m->func   = NULL;
+}}
+
+/* Launch the kernel.
+ * d_A, d_B, d_C — device pointers to float32 arrays of length >= n.
+ * Returns 0 on success, non-zero HIP error code otherwise. */
+static inline int vec_add_wrapper(
+        const vec_add_Module_t *m,
+        hipDeviceptr_t d_A,
+        hipDeviceptr_t d_B,
+        hipDeviceptr_t d_C,
+        int32_t n,
+        hipStream_t stream) {{
+    unsigned int grid_x = ((unsigned int)n + 63u) / 64u;
+    void *args[] = {{ &d_A, &d_B, &d_C, &n }};
+    hipError_t err = hipModuleLaunchKernel(
+            m->func,
+            grid_x, 1, 1,   /* grid  */
+            64,     1, 1,   /* block */
+            0,              /* shared mem bytes */
+            stream,
+            args, NULL);
+    if (err != hipSuccess) {{
+        fprintf(stderr, "vec_add: hipModuleLaunchKernel failed: %s\\n",
+                hipGetErrorString(err));
+        return (int)err;
+    }}
+    return 0;
+}}
+"""
+
+_BYTES_PER_LINE = 16
+
+
+def _format_hex_array(data: bytes) -> str:
+    lines = []
+    for offset in range(0, len(data), _BYTES_PER_LINE):
+        chunk = data[offset: offset + _BYTES_PER_LINE]
+        lines.append("    " + ", ".join(f"0x{b:02x}" for b in chunk))
+    return ",\n".join(lines)
+
+
+def _generate_header(hsaco: bytes, output_path: str) -> None:
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    content = _HEADER_TEMPLATE.format(
+        size=len(hsaco),
+        hex_array=_format_hex_array(hsaco),
+    )
+    with open(output_path, "w") as f:
+        f.write(content)
+    print(f"Wrote {len(hsaco):,} bytes of HSACO to {output_path}")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    print("Compiling vectorAdd kernel (this triggers JIT compilation)...")
+    ir_text = _compile_and_get_ir()
+    print(f"Compiled IR text: {len(ir_text):,} chars")
+
+    print("Extracting HSACO (wave32 / no_wave64 variant)...")
+    hsaco = _extract_hsaco(ir_text, prefer_no_wave64=True)
+    print(f"Extracted HSACO: {len(hsaco):,} bytes")
+
+    # Sanity-check: must start with ELF magic
+    if hsaco[:4] != b"\x7fELF":
+        raise RuntimeError(f"Extracted data does not start with ELF magic: {hsaco[:8].hex()}")
+    print("ELF magic verified.")
+
+    output = os.path.join(os.path.dirname(os.path.abspath(__file__)), "artifacts", "vec_add.h")
+    _generate_header(hsaco, output)
