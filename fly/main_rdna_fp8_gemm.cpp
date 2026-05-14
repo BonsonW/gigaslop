@@ -153,7 +153,7 @@ int main(void) {
 
     /* ── Load module ──────────────────────────────────────────────────────── */
     fp8_gemm_Module_t mod = {};
-    if (fp8_gemm_Module_Load(&mod) != 0) return 1;
+    if (fp8_gemm_Module_Load(&mod, "artifacts/rdna_fp8_gemm.hsaco") != 0) return 1;
 
     /* ── Launch ───────────────────────────────────────────────────────────── */
     hipStream_t stream;

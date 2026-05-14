@@ -1,4 +1,5 @@
 artifacts/*
+fly/artifacts/*
 pyvenv/
 notes.sh
 *__pycache__/
