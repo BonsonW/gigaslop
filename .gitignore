@@ -1,8 +1,13 @@
 artifacts/*
-fly/artifacts/*
 pyvenv/
 notes.sh
 *__pycache__/
 
 FlyDSL
 llvm-project
+
+fly/artifacts/*
+fly/build/*
+
+cute/artifacts/*
+cute/build/*
