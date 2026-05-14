@@ -3,11 +3,12 @@
 The HSACO binary is embedded as a byte array — no separate .hsaco file needed.
 
 Run with:
-    python export_fp8_gemm_embedded.py              # N=8192, K=6144 (defaults)
-    python export_fp8_gemm_embedded.py --N 4096 --K 3072
+    python export_fp8_gemm_embedded.py                                    # N=8192, K=6144 (defaults)
+    python export_fp8_gemm_embedded.py --N 4096 --K 3072                  # single config
+    python export_fp8_gemm_embedded.py --config export_configs/rdna_fp8_gemm.toml  # batch
 
-Outputs:
-    artifacts/rdna_fp8_gemm.h   — all-in-one header (hipModuleLoadData)
+Outputs (single):  artifacts/rdna_fp8_gemm.h
+Outputs (batch):   artifacts/rdna_fp8_gemm_N{N}_K{K}.h  (one per config)
 """
 import argparse
 import os
@@ -17,9 +18,8 @@ os.environ.setdefault("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from export_fp8_gemm import (
-    M,
     _compute_config, _compile_and_get_ir, _extract_hsaco, _find_kernel_name,
-    _COMMON_COMMENT, _format_hex, _fmt, _write_text,
+    _load_configs, _COMMON_COMMENT, _format_hex, _fmt, _write_text,
 )
 
 # ── C header template ─────────────────────────────────────────────────────────
@@ -106,40 +106,49 @@ static inline int fp8_gemm_wrapper(
 
 
 def _generate_embedded(hsaco: bytes, kernel_name: str, artifacts_dir: str,
-                       M: int, N: int, K: int, cfg: dict) -> None:
-    output_path = os.path.join(artifacts_dir, "rdna_fp8_gemm.h")
+                       M: int, N: int, K: int, cfg: dict,
+                       name: str = "rdna_fp8_gemm") -> None:
+    output_path = os.path.join(artifacts_dir, f"{name}.h")
     _write_text(output_path, _fmt(_EMBEDDED_HEADER_TEMPLATE, hsaco, kernel_name, M, N, K, cfg))
-    print(f"Wrote {len(hsaco):,} bytes of HSACO (embedded) to {output_path}")
+    print(f"  Wrote {len(hsaco):,} bytes of HSACO (embedded) → {output_path}")
+
+
+def _export_one(M: int, N: int, K: int, artifacts_dir: str) -> None:
+    cfg = _compute_config(M, N, K)
+    name = f"rdna_fp8_gemm_N{N}_K{K}_TM{cfg['tile_m']}_TN{cfg['tile_n']}"
+    print(f"\n[M={M}, N={N}, K={K}]  tile_m={cfg['tile_m']}, tile_n={cfg['tile_n']}, "
+          f"waves=({cfg['waves_m']},{cfg['waves_n']}), "
+          f"threads={cfg['threads_per_block']}, blocks={cfg['total_blocks']}")
+
+    ir_text = _compile_and_get_ir(M, N, K)
+    kernel_name = _find_kernel_name(ir_text)
+    print(f"  Kernel: {kernel_name}  IR: {len(ir_text):,} chars")
+
+    hsaco = _extract_hsaco(ir_text, prefer_no_wave64=True)
+    if hsaco[:4] != b"\x7fELF":
+        raise RuntimeError(f"Expected ELF magic, got: {hsaco[:8].hex()}")
+
+    _generate_embedded(hsaco, kernel_name, artifacts_dir, M, N, K, cfg, name=name)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Export fp8 GEMM kernel as embedded C header.")
+    parser.add_argument("--config", metavar="FILE",
+                        help="TOML config file with a list of M,N,K configs to batch-export")
+    parser.add_argument("--M", type=int, default=32,  help="Batch dimension for tile selection (default: 32)")
     parser.add_argument("--N", type=int, default=8192, help="Output dimension (default: 8192)")
     parser.add_argument("--K", type=int, default=6144, help="Reduction dimension (default: 6144)")
     args = parser.parse_args()
 
-    N, K = args.N, args.K
-    cfg = _compute_config(M, N, K)
-    print(f"Compiling fp8 GEMM kernel (M={M}, N={N}, K={K})...")
-    print(f"  tile_m={cfg['tile_m']}, tile_n={cfg['tile_n']}, "
-          f"waves=({cfg['waves_m']},{cfg['waves_n']}), "
-          f"threads={cfg['threads_per_block']}, blocks={cfg['total_blocks']}")
-
-    ir_text = _compile_and_get_ir(M, N, K)
-    print(f"Compiled IR text: {len(ir_text):,} chars")
-
-    kernel_name = _find_kernel_name(ir_text)
-    print(f"Kernel name: {kernel_name}")
-
-    print("Extracting HSACO (wave32 / no_wave64 variant)...")
-    hsaco = _extract_hsaco(ir_text, prefer_no_wave64=True)
-    print(f"Extracted HSACO: {len(hsaco):,} bytes")
-
-    if hsaco[:4] != b"\x7fELF":
-        raise RuntimeError(f"Expected ELF magic, got: {hsaco[:8].hex()}")
-    print("ELF magic verified.")
-
     artifacts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "artifacts")
-    _generate_embedded(hsaco, kernel_name, artifacts_dir, M, N, K, cfg)
+
+    if args.config:
+        configs = _load_configs(args.config, default_m=args.M)
+        print(f"Batch export: {len(configs)} config(s) from {args.config}")
+        for M, N, K in configs:
+            _export_one(M, N, K, artifacts_dir)
+        print(f"\nDone. {len(configs)} kernel(s) exported to {artifacts_dir}/")
+    else:
+        _export_one(args.M, args.N, args.K, artifacts_dir)

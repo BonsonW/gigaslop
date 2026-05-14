@@ -1,14 +1,14 @@
 """Export rdna_fp8_preshuffle_gemm as a raw HSACO binary + C header.
 
-Configuration: M=32 (fixed; runtime-dynamic), N and K from args.
+Configuration: M=32 (fixed; runtime-dynamic), N and K from args or config file.
 
 Run with:
-    python export_fp8_gemm.py              # N=8192, K=6144 (defaults)
-    python export_fp8_gemm.py --N 4096 --K 3072
+    python export_fp8_gemm.py                                    # N=8192, K=6144 (defaults)
+    python export_fp8_gemm.py --N 4096 --K 3072                  # single config
+    python export_fp8_gemm.py --config export_configs/rdna_fp8_gemm.toml  # batch
 
-Outputs:
-    artifacts/rdna_fp8_gemm.hsaco   — raw HSACO ELF binary
-    artifacts/rdna_fp8_gemm.h       — launcher header (hipModuleLoad from path)
+Outputs (single):  artifacts/rdna_fp8_gemm.hsaco + .h
+Outputs (batch):   artifacts/rdna_fp8_gemm_N{N}_K{K}.hsaco + .h  (one pair per config)
 
 For an all-in-one embedded header use:
     python export_fp8_gemm_embedded.py
@@ -18,6 +18,14 @@ import os
 import re
 import sys
 
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ModuleNotFoundError:
+        tomllib = None  # type: ignore[assignment]
+
 os.environ.setdefault("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
 
 import torch
@@ -25,8 +33,6 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rdna_fp8_preshuffle_gemm import compile_fp8_gemm
 
-# M is fixed at export time; N and K are passed as CLI args.
-M = 1024
 
 # ── Tile / wave auto-selection (mirrors compile_fp8_gemm) ─────────────────────
 
@@ -55,6 +61,20 @@ def _compute_config(M: int, N: int, K: int, tile_m: int = 32) -> dict:
         threads_per_block=waves_m * waves_n * 32,
         total_blocks=(M // tile_m) * (N // tile_n),
     )
+
+
+def _load_configs(path: str, default_m: int = 32) -> list[tuple[int, int, int]]:
+    """Parse a TOML config file and return a list of (M, N, K) triples.
+
+    Each [[configs]] entry must have N and K; M is optional and falls back to default_m.
+    """
+    if tomllib is None:
+        raise RuntimeError(
+            "tomllib not available — upgrade to Python 3.11+ or `pip install tomli`"
+        )
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+    return [(int(c.get("M", default_m)), int(c["N"]), int(c["K"])) for c in data["configs"]]
 
 
 # ── Compilation ───────────────────────────────────────────────────────────────
@@ -261,45 +281,54 @@ def _write_text(path: str, content: str) -> None:
 
 
 def _generate_hsaco(hsaco: bytes, kernel_name: str, artifacts_dir: str,
-                    M: int, N: int, K: int, cfg: dict) -> None:
-    hsaco_path  = os.path.join(artifacts_dir, "rdna_fp8_gemm.hsaco")
-    header_path = os.path.join(artifacts_dir, "rdna_fp8_gemm.h")
+                    M: int, N: int, K: int, cfg: dict,
+                    name: str = "rdna_fp8_gemm") -> None:
+    hsaco_path  = os.path.join(artifacts_dir, f"{name}.hsaco")
+    header_path = os.path.join(artifacts_dir, f"{name}.h")
     os.makedirs(artifacts_dir, exist_ok=True)
     with open(hsaco_path, "wb") as f:
         f.write(hsaco)
     _write_text(header_path, _fmt(_FILE_HEADER_TEMPLATE, hsaco, kernel_name, M, N, K, cfg))
-    print(f"Wrote {len(hsaco):,} bytes of HSACO to {hsaco_path}")
-    print(f"Wrote header (hipModuleLoad) to {header_path}")
+    print(f"  Wrote {len(hsaco):,} bytes of HSACO → {hsaco_path}")
+    print(f"  Wrote header (hipModuleLoad) → {header_path}")
+
+
+def _export_one(M: int, N: int, K: int, artifacts_dir: str) -> None:
+    cfg = _compute_config(M, N, K)
+    name = f"rdna_fp8_gemm_N{N}_K{K}_TM{cfg['tile_m']}_TN{cfg['tile_n']}"
+    print(f"\n[M={M}, N={N}, K={K}]  tile_m={cfg['tile_m']}, tile_n={cfg['tile_n']}, "
+          f"waves=({cfg['waves_m']},{cfg['waves_n']}), "
+          f"threads={cfg['threads_per_block']}, blocks={cfg['total_blocks']}")
+
+    ir_text = _compile_and_get_ir(M, N, K)
+    kernel_name = _find_kernel_name(ir_text)
+    print(f"  Kernel: {kernel_name}  IR: {len(ir_text):,} chars")
+
+    hsaco = _extract_hsaco(ir_text, prefer_no_wave64=True)
+    if hsaco[:4] != b"\x7fELF":
+        raise RuntimeError(f"Expected ELF magic, got: {hsaco[:8].hex()}")
+
+    _generate_hsaco(hsaco, kernel_name, artifacts_dir, M, N, K, cfg, name=name)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Export fp8 GEMM kernel as HSACO + C header.")
+    parser.add_argument("--config", metavar="FILE",
+                        help="TOML config file with a list of M,N,K configs to batch-export")
+    parser.add_argument("--M", type=int, default=32,  help="Batch dimension for tile selection (default: 32)")
     parser.add_argument("--N", type=int, default=8192, help="Output dimension (default: 8192)")
     parser.add_argument("--K", type=int, default=6144, help="Reduction dimension (default: 6144)")
     args = parser.parse_args()
 
-    N, K = args.N, args.K
-    cfg = _compute_config(M, N, K)
-    print(f"Compiling fp8 GEMM kernel (M={M}, N={N}, K={K})...")
-    print(f"  tile_m={cfg['tile_m']}, tile_n={cfg['tile_n']}, "
-          f"waves=({cfg['waves_m']},{cfg['waves_n']}), "
-          f"threads={cfg['threads_per_block']}, blocks={cfg['total_blocks']}")
-
-    ir_text = _compile_and_get_ir(M, N, K)
-    print(f"Compiled IR text: {len(ir_text):,} chars")
-
-    kernel_name = _find_kernel_name(ir_text)
-    print(f"Kernel name: {kernel_name}")
-
-    print("Extracting HSACO (wave32 / no_wave64 variant)...")
-    hsaco = _extract_hsaco(ir_text, prefer_no_wave64=True)
-    print(f"Extracted HSACO: {len(hsaco):,} bytes")
-
-    if hsaco[:4] != b"\x7fELF":
-        raise RuntimeError(f"Expected ELF magic, got: {hsaco[:8].hex()}")
-    print("ELF magic verified.")
-
     artifacts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "artifacts")
-    _generate_hsaco(hsaco, kernel_name, artifacts_dir, M, N, K, cfg)
+
+    if args.config:
+        configs = _load_configs(args.config, default_m=args.M)
+        print(f"Batch export: {len(configs)} config(s) from {args.config}")
+        for M, N, K in configs:
+            _export_one(M, N, K, artifacts_dir)
+        print(f"\nDone. {len(configs)} kernel(s) exported to {artifacts_dir}/")
+    else:
+        _export_one(args.M, args.N, args.K, artifacts_dir)

@@ -1,0 +1,21 @@
+# Export configurations for rdna_fp8_gemm
+# Run: python fly/export_fp8_gemm.py --config fly/export_configs/rdna_fp8_gemm.toml
+#
+# Each [[configs]] entry compiles a separate HSACO + C header pair.
+# M is optional per entry; if omitted, uses the --M CLI arg (default 32).
+# M affects tile_n and wave layout selection (see _compute_config).
+#
+# Outputs: artifacts/rdna_fp8_gemm_N{N}_K{K}.hsaco
+#          artifacts/rdna_fp8_gemm_N{N}_K{K}.h
+
+# qkv -> rotary emb dims
+[[configs]]
+M = 256
+N = 512
+K = 1536
+
+# gated mlp entry
+[[configs]]
+M = 256
+N = 512
+K = 4096
