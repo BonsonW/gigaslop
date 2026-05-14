@@ -1,15 +1,19 @@
 """Export rdna_fp8_preshuffle_gemm as a raw HSACO binary + C header.
 
-Configuration: M=32, N=8192, K=6144 (decode-phase inference default).
+Configuration: M=32 (fixed; runtime-dynamic), N and K from args.
 
 Run with:
-    python export_fp8_gemm.py            # default: .hsaco + .h (hipModuleLoad)
-    python export_fp8_gemm.py --embedded # legacy: all-in-one header
+    python export_fp8_gemm.py              # N=8192, K=6144 (defaults)
+    python export_fp8_gemm.py --N 4096 --K 3072
 
-Outputs (default):
+Outputs:
     artifacts/rdna_fp8_gemm.hsaco   — raw HSACO ELF binary
-    artifacts/rdna_fp8_gemm.h       — launcher header (loads from file path)
+    artifacts/rdna_fp8_gemm.h       — launcher header (hipModuleLoad from path)
+
+For an all-in-one embedded header use:
+    python export_fp8_gemm_embedded.py
 """
+import argparse
 import os
 import re
 import sys
@@ -21,22 +25,41 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rdna_fp8_preshuffle_gemm import compile_fp8_gemm
 
-# ── Shape ─────────────────────────────────────────────────────────────────────
-M, N, K = 32, 8192, 6144
+# M is fixed at export time; N and K are passed as CLI args.
+M = 1024
 
-# These reproduce the auto-selection logic inside compile_fp8_gemm for M=32:
-#   tile_n = 128  (M < 256)
-#   k_unroll = 2  (M < 256)
-#   waves_m = 1, waves_n = 2  (tile_n >= 128 and tile_m < 64)
-TILE_M, TILE_N = 32, 128
-WAVES_M, WAVES_N = 1, 2
-THREADS_PER_BLOCK = WAVES_M * WAVES_N * 32   # = 64
-TOTAL_BLOCKS = (M // TILE_M) * (N // TILE_N)  # = 64
+# ── Tile / wave auto-selection (mirrors compile_fp8_gemm) ─────────────────────
+
+def _compute_config(M: int, N: int, K: int, tile_m: int = 32) -> dict:
+    """Return tile/wave constants for the given shape, matching compile_fp8_gemm."""
+    tile_n = 256 if M >= 256 else 128
+
+    if tile_m >= 128 and tile_n >= 128:
+        waves_m, waves_n = 2, 2
+    elif tile_m >= 64 and tile_n >= 128:
+        waves_m, waves_n = 2, 2
+    elif tile_n >= 256:
+        waves_m, waves_n = 1, 2
+    elif tile_m >= 64:
+        waves_m, waves_n = 2, 1
+    elif tile_n >= 128:
+        waves_m, waves_n = 1, 2
+    else:
+        waves_m, waves_n = 1, 1
+
+    return dict(
+        tile_m=tile_m,
+        tile_n=tile_n,
+        waves_m=waves_m,
+        waves_n=waves_n,
+        threads_per_block=waves_m * waves_n * 32,
+        total_blocks=(M // tile_m) * (N // tile_n),
+    )
 
 
 # ── Compilation ───────────────────────────────────────────────────────────────
 
-def _compile_and_get_ir():
+def _compile_and_get_ir(M: int, N: int, K: int):
     launcher = compile_fp8_gemm(M=M, N=N, K=K)
 
     # Dummy tensors to trigger JIT — shapes/dtypes must match what the kernel
@@ -206,87 +229,6 @@ static inline int fp8_gemm_wrapper(
 }}
 """
 
-# Legacy: everything embedded as a byte array in a single header
-_EMBEDDED_HEADER_TEMPLATE = _COMMON_COMMENT + """\
- * Build: hipcc -o main_rdna_fp8_gemm main_rdna_fp8_gemm.cpp
- */
-#pragma once
-#include <hip/hip_runtime.h>
-#include <stdint.h>
-#include <stdio.h>
-
-/* ── Compiled-in constants (N, K, tile sizes fixed at export time) ── */
-#define FP8_GEMM_N                  {N}
-#define FP8_GEMM_K                  {K}
-#define FP8_GEMM_TILE_M             {tile_m}
-#define FP8_GEMM_TILE_N             {tile_n}
-#define FP8_GEMM_THREADS_PER_BLOCK  {threads_per_block}
-
-/* ── Embedded HSACO binary ({size} bytes) ── */
-static const uint8_t fp8_gemm_hsaco[] = {{
-{hex_array}
-}};
-
-/* ── Module handle ── */
-typedef struct {{
-    hipModule_t   module;
-    hipFunction_t func;
-}} fp8_gemm_Module_t;
-
-static inline int fp8_gemm_Module_Load(fp8_gemm_Module_t *m) {{
-    hipError_t err = hipModuleLoadData(&m->module, fp8_gemm_hsaco);
-    if (err != hipSuccess) {{
-        fprintf(stderr, "fp8_gemm: hipModuleLoadData: %s\\n", hipGetErrorString(err));
-        return (int)err;
-    }}
-    err = hipModuleGetFunction(&m->func, m->module, "{kernel_name}");
-    if (err != hipSuccess) {{
-        fprintf(stderr, "fp8_gemm: hipModuleGetFunction: %s\\n", hipGetErrorString(err));
-        (void)hipModuleUnload(m->module);
-        return (int)err;
-    }}
-    return 0;
-}}
-
-static inline void fp8_gemm_Module_Unload(fp8_gemm_Module_t *m) {{
-    if (m->module) (void)hipModuleUnload(m->module);
-    m->module = NULL;
-    m->func   = NULL;
-}}
-
-/* Launch the kernel.
- * M must be a runtime multiple of FP8_GEMM_TILE_M; N and K are fixed at export time.
- * d_B_shuf must already be in preshuffled layout [{N_div16},{K_div16},2,16,8].
- * Returns 0 on success, non-zero HIP error code otherwise. */
-static inline int fp8_gemm_wrapper(
-        const fp8_gemm_Module_t *m,
-        hipDeviceptr_t d_C,       /* bf16  [M, {N}] */
-        hipDeviceptr_t d_A,       /* fp8   [M, {K}] */
-        hipDeviceptr_t d_B_shuf,  /* fp8   [{N_div16},{K_div16},2,16,8] */
-        hipDeviceptr_t d_scale_a, /* f32   [M] */
-        hipDeviceptr_t d_scale_b, /* f32   [{N}] */
-        int32_t M,
-        hipStream_t stream) {{
-    if (M % FP8_GEMM_TILE_M != 0) {{
-        fprintf(stderr, "fp8_gemm: M=%d not divisible by tile_m=%d\\n", M, FP8_GEMM_TILE_M);
-        return -1;
-    }}
-    int32_t grid_m = M / FP8_GEMM_TILE_M;
-    unsigned int total_blocks = (unsigned int)grid_m * ({N} / FP8_GEMM_TILE_N);
-    void *args[] = {{ &d_C, &d_A, &d_B_shuf, &d_scale_a, &d_scale_b, &grid_m }};
-    hipError_t err = hipModuleLaunchKernel(
-            m->func,
-            total_blocks, 1, 1,
-            FP8_GEMM_THREADS_PER_BLOCK, 1, 1,
-            0, stream, args, NULL);
-    if (err != hipSuccess) {{
-        fprintf(stderr, "fp8_gemm: hipModuleLaunchKernel: %s\\n", hipGetErrorString(err));
-        return (int)err;
-    }}
-    return 0;
-}}
-"""
-
 _BYTES_PER_LINE = 16
 
 
@@ -298,14 +240,15 @@ def _format_hex(data: bytes) -> str:
     return ",\n".join(lines)
 
 
-def _fmt(template: str, hsaco: bytes, kernel_name: str) -> str:
+def _fmt(template: str, hsaco: bytes, kernel_name: str,
+         M: int, N: int, K: int, cfg: dict) -> str:
     return template.format(
         kernel_name=kernel_name,
         M=M, N=N, K=K,
         N_div16=N // 16, K_div16=K // 16,
-        tile_m=TILE_M, tile_n=TILE_N,
-        total_blocks=TOTAL_BLOCKS,
-        threads_per_block=THREADS_PER_BLOCK,
+        tile_m=cfg["tile_m"], tile_n=cfg["tile_n"],
+        total_blocks=cfg["total_blocks"],
+        threads_per_block=cfg["threads_per_block"],
         size=len(hsaco),
         hex_array=_format_hex(hsaco),
     )
@@ -317,30 +260,34 @@ def _write_text(path: str, content: str) -> None:
         f.write(content)
 
 
-def _generate_hsaco(hsaco: bytes, kernel_name: str, artifacts_dir: str) -> None:
+def _generate_hsaco(hsaco: bytes, kernel_name: str, artifacts_dir: str,
+                    M: int, N: int, K: int, cfg: dict) -> None:
     hsaco_path  = os.path.join(artifacts_dir, "rdna_fp8_gemm.hsaco")
     header_path = os.path.join(artifacts_dir, "rdna_fp8_gemm.h")
     os.makedirs(artifacts_dir, exist_ok=True)
     with open(hsaco_path, "wb") as f:
         f.write(hsaco)
-    _write_text(header_path, _fmt(_FILE_HEADER_TEMPLATE, hsaco, kernel_name))
+    _write_text(header_path, _fmt(_FILE_HEADER_TEMPLATE, hsaco, kernel_name, M, N, K, cfg))
     print(f"Wrote {len(hsaco):,} bytes of HSACO to {hsaco_path}")
     print(f"Wrote header (hipModuleLoad) to {header_path}")
-
-
-def _generate_embedded(hsaco: bytes, kernel_name: str, artifacts_dir: str) -> None:
-    output_path = os.path.join(artifacts_dir, "rdna_fp8_gemm.h")
-    _write_text(output_path, _fmt(_EMBEDDED_HEADER_TEMPLATE, hsaco, kernel_name))
-    print(f"Wrote {len(hsaco):,} bytes of HSACO (embedded) to {output_path}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    embedded = "--embedded" in sys.argv
+    parser = argparse.ArgumentParser(description="Export fp8 GEMM kernel as HSACO + C header.")
+    parser.add_argument("--N", type=int, default=8192, help="Output dimension (default: 8192)")
+    parser.add_argument("--K", type=int, default=6144, help="Reduction dimension (default: 6144)")
+    args = parser.parse_args()
 
+    N, K = args.N, args.K
+    cfg = _compute_config(M, N, K)
     print(f"Compiling fp8 GEMM kernel (M={M}, N={N}, K={K})...")
-    ir_text = _compile_and_get_ir()
+    print(f"  tile_m={cfg['tile_m']}, tile_n={cfg['tile_n']}, "
+          f"waves=({cfg['waves_m']},{cfg['waves_n']}), "
+          f"threads={cfg['threads_per_block']}, blocks={cfg['total_blocks']}")
+
+    ir_text = _compile_and_get_ir(M, N, K)
     print(f"Compiled IR text: {len(ir_text):,} chars")
 
     kernel_name = _find_kernel_name(ir_text)
@@ -355,7 +302,4 @@ if __name__ == "__main__":
     print("ELF magic verified.")
 
     artifacts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "artifacts")
-    if embedded:
-        _generate_embedded(hsaco, kernel_name, artifacts_dir)
-    else:
-        _generate_hsaco(hsaco, kernel_name, artifacts_dir)
+    _generate_hsaco(hsaco, kernel_name, artifacts_dir, M, N, K, cfg)
