@@ -79,12 +79,11 @@ static uint8_t encode_fp8(float val) {
     return sign | ((uint8_t)exp_biased << 3) | (uint8_t)mant3;
 }
 
-/* ── bf16 helpers ────────────────────────────────────────────────────────── */
-static float bf16_to_float(uint16_t v) {
-    uint32_t bits = (uint32_t)v << 16;
-    float f;
-    memcpy(&f, &bits, 4);
-    return f;
+/* ── fp16 helpers ────────────────────────────────────────────────────────── */
+static float fp16_to_float(uint16_t v) {
+    __half h;
+    memcpy(&h, &v, sizeof(h));
+    return __half2float(h);
 }
 
 /* ── B preshuffle ────────────────────────────────────────────────────────── */
@@ -193,7 +192,7 @@ int main(int argc, char *argv[]) {
     int  mismatches = 0;
     for (int m = 0; m < M && mismatches < 5; m++) {
         for (int n = 0; n < N; n++) {
-            float got = bf16_to_float(h_C[m * N + n]);
+            float got = fp16_to_float(h_C[m * N + n]);
             if (fabsf(got - expected) > 0.5f) {
                 fprintf(stderr, "Mismatch C[%d,%d]: got %.1f  expected %.1f\n",
                         m, n, (double)got, (double)expected);

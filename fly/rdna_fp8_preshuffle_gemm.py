@@ -5,7 +5,7 @@ Optimized for M=32, N=8192, K=6144 (decode-phase inference shape).
   C[M,N] = A[M,K] @ B[K,N]
 
 Both A and B are fp8_e4m3fn with per-tensor scales.
-Output is bf16.  Accumulation in f32.
+Output is fp16.  Accumulation in f32.
 
 A is loaded directly from raw [M,K] layout (no preshuffle needed).
 Uses per-token (rowwise) scaling: scale_a[M] for activation, scale_b[N] for weight.
@@ -389,9 +389,9 @@ def compile_fp8_gemm(
                     g_col = tile_n0 + wmma_n_off + lane16
                     val = accs[idx][si]
                     val = val * sa_cache[si] * sb_val
-                    val_bf16 = val.to(fx.BFloat16)
+                    val_fp16 = val.to(fx.Float16)
                     elem_off = g_row * N + g_col
-                    buffer_ops.buffer_store(val_bf16, c_rsrc, elem_off)
+                    buffer_ops.buffer_store(val_fp16, c_rsrc, elem_off)
 
     # ── Host launcher ──────────────────────────────────────────────────────
     @flyc.jit

@@ -84,7 +84,7 @@ def _compile_and_get_ir(M: int, N: int, K: int):
 
     # Dummy tensors to trigger JIT — shapes/dtypes must match what the kernel
     # expects from buffer_ops (raw byte access), so dtype only affects cache key.
-    C       = torch.zeros(M, N, dtype=torch.bfloat16).cuda()
+    C       = torch.zeros(M, N, dtype=torch.float16).cuda()
     A       = torch.zeros(M, K, dtype=torch.uint8).cuda()     # fp8 stored as u8
     B_shuf  = torch.zeros(N // 16, K // 16, 2, 16, 8, dtype=torch.uint8).cuda()
     scale_a = torch.ones(M, dtype=torch.float32).cuda()
@@ -154,12 +154,12 @@ _COMMON_COMMENT = """\
  * HSACO ELF for {kernel_name} (gfx1201, wave32/RDNA4).
  *
  * Computes:  C[M,N] = (A[M,K] @ B[K,N]) * scale_a[M,1] * scale_b[1,N]
- * where A and B are fp8_e4m3fn, output C is bf16.
+ * where A and B are fp8_e4m3fn, output C is fp16.
  *
  * Fixed dimensions: M={M}, N={N}, K={K}
  *   A:       fp8_e4m3fn  [{M}, {K}]         — raw row-major
  *   B:       fp8_e4m3fn  [{N}//16, {K}//16, 2, 16, 8]  — preshuffled (see below)
- *   C:       bf16        [{M}, {N}]         — output
+ *   C:       fp16        [{M}, {N}]         — output
  *   scale_a: f32         [{M}]              — per-token (per-row) activation scale
  *   scale_b: f32         [{N}]              — per-channel weight scale
  *
