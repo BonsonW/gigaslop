@@ -177,6 +177,7 @@ def compile_fp8_gemm(
         arg_b: fx.Tensor,
         arg_scale_a: fx.Tensor,
         arg_scale_b: fx.Tensor,
+        arg_grid_m: fx.Int32,   # runtime: M // tile_m
     ):
         # === Thread/block IDs ===
         tid = gpu.thread_id("x")
@@ -187,15 +188,21 @@ def compile_fp8_gemm(
         lane16 = lane % 16
         klane = lane // 16
 
-        # === L2 cache swizzle ===
-        effective_group_m = min(group_m, grid_m)
-        num_pid_in_group = effective_group_m * grid_n
-        group_id = pid // num_pid_in_group
-        first_pid_m = group_id * effective_group_m
-        group_size_m = effective_group_m
-        pid_in_group = pid % num_pid_in_group
-        bid_m = first_pid_m + (pid_in_group % group_size_m)
-        bid_n = pid_in_group // group_size_m
+        # === L2 cache swizzle (runtime arg_grid_m) ===
+        pid_i32      = fx.arith.index_cast(fx.T.i32(), pid)
+        group_m_cst  = fx.arith.constant(group_m, type=fx.T.i32())
+        grid_n_cst   = fx.arith.constant(grid_n,  type=fx.T.i32())
+        eff_gm       = fx.arith.select(
+            fx.arith.cmpi(fx.arith.CmpIPredicate.slt, arg_grid_m, group_m_cst),
+            arg_grid_m, group_m_cst,
+        )
+        num_in_group = eff_gm * grid_n_cst
+        group_id     = pid_i32 // num_in_group
+        pid_in_group = pid_i32 % num_in_group
+        bid_m_i32    = group_id * eff_gm + pid_in_group % eff_gm
+        bid_n_i32    = pid_in_group // eff_gm
+        bid_m = fx.arith.index_cast(fx.T.index(), bid_m_i32)
+        bid_n = fx.arith.index_cast(fx.T.index(), bid_n_i32)
 
         # === Wave position within workgroup ===
         wave_m = wave_id // waves_n
@@ -395,12 +402,14 @@ def compile_fp8_gemm(
         arg_scale_a: fx.Tensor,
         arg_scale_b: fx.Tensor,
         stream: fx.Stream,
+        m: fx.Int32,            # runtime M dimension
     ):
         c1 = 1
-        total_blocks = grid_m * grid_n
+        dyn_grid_m   = m // tile_m
+        total_blocks = dyn_grid_m * grid_n
         bk = THREADS_PER_BLOCK
 
-        launcher = kernel_gemm(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b)
+        launcher = kernel_gemm(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, dyn_grid_m)
         launcher.launch(
             grid=(total_blocks, c1, c1),
             block=(bk, c1, c1),

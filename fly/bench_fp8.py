@@ -93,14 +93,14 @@ def benchmark(launcher_, warmup=10, iterations=200):
     tops            = (total_ops   / avg_time_s) / 1e12
 
     # RDNA4 AI PRO R9700 peak numbers
-    peak_tops   = 383.0    # FP8 matrix (E4M3/E5M2) peak (TOPS)
+    peak_tops   = 383.0    # FP8 matrix (E4M3/E5M2) peak (TFLOPS)
     peak_bw_gbs = 640.0    # GDDR6 peak bandwidth (GB/s)
 
     print(f"Performance Metrics:")
     print(f"  Problem:              batch={batch_size}, seq={sequence_len}, in={in_features}, out={out_features}")
     print(f"  Matrix shape:         M={M} (batch*seq), N={N}, K={K}")
     print(f"  Execution time:       {avg_time_us:.2f} us")
-    print(f"  Compute:              {tops:.3f} TOPS  ({tops/peak_tops*100:.1f}% of {peak_tops} TOPS peak)")
+    print(f"  Compute:              {tops:.3f} TFLOPS  ({tops/peak_tops*100:.1f}% of {peak_tops} TOPS peak)")
     print(f"  Bandwidth:            {achieved_bw_gbs:.1f} GB/s  ({achieved_bw_gbs/peak_bw_gbs*100:.1f}% of {peak_bw_gbs} GB/s peak)")
     print(f"  Arithmetic intensity: {total_ops/total_bytes:.1f} FLOP/byte")
 

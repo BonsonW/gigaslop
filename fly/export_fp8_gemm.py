@@ -48,7 +48,7 @@ def _compile_and_get_ir():
     scale_b = torch.ones(N, dtype=torch.float32).cuda()
     stream  = torch.cuda.current_stream()
 
-    launcher(C, A, B_shuf, scale_a, scale_b, stream)
+    launcher(C, A, B_shuf, scale_a, scale_b, stream, M)
     torch.cuda.synchronize()
 
     artifacts = list(launcher._mem_cache.values())
@@ -135,7 +135,15 @@ _FILE_HEADER_TEMPLATE = _COMMON_COMMENT + """\
  */
 #pragma once
 #include <hip/hip_runtime.h>
+#include <stdint.h>
 #include <stdio.h>
+
+/* ── Compiled-in constants (N, K, tile sizes fixed at export time) ── */
+#define FP8_GEMM_N                  {N}
+#define FP8_GEMM_K                  {K}
+#define FP8_GEMM_TILE_M             {tile_m}
+#define FP8_GEMM_TILE_N             {tile_n}
+#define FP8_GEMM_THREADS_PER_BLOCK  {threads_per_block}
 
 /* ── Module handle ── */
 typedef struct {{
@@ -166,22 +174,29 @@ static inline void fp8_gemm_Module_Unload(fp8_gemm_Module_t *m) {{
 }}
 
 /* Launch the kernel.
- * All device pointers must point to contiguous row-major device memory.
+ * M must be a runtime multiple of FP8_GEMM_TILE_M; N and K are fixed at export time.
  * d_B_shuf must already be in preshuffled layout [{N_div16},{K_div16},2,16,8].
  * Returns 0 on success, non-zero HIP error code otherwise. */
 static inline int fp8_gemm_wrapper(
         const fp8_gemm_Module_t *m,
-        hipDeviceptr_t d_C,       /* bf16  [{M},{N}] */
-        hipDeviceptr_t d_A,       /* fp8   [{M},{K}] */
+        hipDeviceptr_t d_C,       /* bf16  [M, {N}] */
+        hipDeviceptr_t d_A,       /* fp8   [M, {K}] */
         hipDeviceptr_t d_B_shuf,  /* fp8   [{N_div16},{K_div16},2,16,8] */
-        hipDeviceptr_t d_scale_a, /* f32   [{M}] */
+        hipDeviceptr_t d_scale_a, /* f32   [M] */
         hipDeviceptr_t d_scale_b, /* f32   [{N}] */
+        int32_t M,
         hipStream_t stream) {{
-    void *args[] = {{ &d_C, &d_A, &d_B_shuf, &d_scale_a, &d_scale_b }};
+    if (M % FP8_GEMM_TILE_M != 0) {{
+        fprintf(stderr, "fp8_gemm: M=%d not divisible by tile_m=%d\\n", M, FP8_GEMM_TILE_M);
+        return -1;
+    }}
+    int32_t grid_m = M / FP8_GEMM_TILE_M;
+    unsigned int total_blocks = (unsigned int)grid_m * ({N} / FP8_GEMM_TILE_N);
+    void *args[] = {{ &d_C, &d_A, &d_B_shuf, &d_scale_a, &d_scale_b, &grid_m }};
     hipError_t err = hipModuleLaunchKernel(
             m->func,
-            {total_blocks}, 1, 1,        /* grid  */
-            {threads_per_block}, 1, 1,   /* block */
+            total_blocks, 1, 1,
+            FP8_GEMM_THREADS_PER_BLOCK, 1, 1,
             0, stream, args, NULL);
     if (err != hipSuccess) {{
         fprintf(stderr, "fp8_gemm: hipModuleLaunchKernel: %s\\n", hipGetErrorString(err));
@@ -200,11 +215,17 @@ _EMBEDDED_HEADER_TEMPLATE = _COMMON_COMMENT + """\
 #include <stdint.h>
 #include <stdio.h>
 
+/* ── Compiled-in constants (N, K, tile sizes fixed at export time) ── */
+#define FP8_GEMM_N                  {N}
+#define FP8_GEMM_K                  {K}
+#define FP8_GEMM_TILE_M             {tile_m}
+#define FP8_GEMM_TILE_N             {tile_n}
+#define FP8_GEMM_THREADS_PER_BLOCK  {threads_per_block}
+
 /* ── Embedded HSACO binary ({size} bytes) ── */
 static const uint8_t fp8_gemm_hsaco[] = {{
 {hex_array}
 }};
-static const size_t fp8_gemm_hsaco_size = {size}UL;
 
 /* ── Module handle ── */
 typedef struct {{
@@ -234,22 +255,29 @@ static inline void fp8_gemm_Module_Unload(fp8_gemm_Module_t *m) {{
 }}
 
 /* Launch the kernel.
- * All device pointers must point to contiguous row-major device memory.
+ * M must be a runtime multiple of FP8_GEMM_TILE_M; N and K are fixed at export time.
  * d_B_shuf must already be in preshuffled layout [{N_div16},{K_div16},2,16,8].
  * Returns 0 on success, non-zero HIP error code otherwise. */
 static inline int fp8_gemm_wrapper(
         const fp8_gemm_Module_t *m,
-        hipDeviceptr_t d_C,       /* bf16  [{M},{N}] */
-        hipDeviceptr_t d_A,       /* fp8   [{M},{K}] */
+        hipDeviceptr_t d_C,       /* bf16  [M, {N}] */
+        hipDeviceptr_t d_A,       /* fp8   [M, {K}] */
         hipDeviceptr_t d_B_shuf,  /* fp8   [{N_div16},{K_div16},2,16,8] */
-        hipDeviceptr_t d_scale_a, /* f32   [{M}] */
+        hipDeviceptr_t d_scale_a, /* f32   [M] */
         hipDeviceptr_t d_scale_b, /* f32   [{N}] */
+        int32_t M,
         hipStream_t stream) {{
-    void *args[] = {{ &d_C, &d_A, &d_B_shuf, &d_scale_a, &d_scale_b }};
+    if (M % FP8_GEMM_TILE_M != 0) {{
+        fprintf(stderr, "fp8_gemm: M=%d not divisible by tile_m=%d\\n", M, FP8_GEMM_TILE_M);
+        return -1;
+    }}
+    int32_t grid_m = M / FP8_GEMM_TILE_M;
+    unsigned int total_blocks = (unsigned int)grid_m * ({N} / FP8_GEMM_TILE_N);
+    void *args[] = {{ &d_C, &d_A, &d_B_shuf, &d_scale_a, &d_scale_b, &grid_m }};
     hipError_t err = hipModuleLaunchKernel(
             m->func,
-            {total_blocks}, 1, 1,        /* grid  */
-            {threads_per_block}, 1, 1,   /* block */
+            total_blocks, 1, 1,
+            FP8_GEMM_THREADS_PER_BLOCK, 1, 1,
             0, stream, args, NULL);
     if (err != hipSuccess) {{
         fprintf(stderr, "fp8_gemm: hipModuleLaunchKernel: %s\\n", hipGetErrorString(err));
@@ -275,6 +303,7 @@ def _fmt(template: str, hsaco: bytes, kernel_name: str) -> str:
         kernel_name=kernel_name,
         M=M, N=N, K=K,
         N_div16=N // 16, K_div16=K // 16,
+        tile_m=TILE_M, tile_n=TILE_N,
         total_blocks=TOTAL_BLOCKS,
         threads_per_block=THREADS_PER_BLOCK,
         size=len(hsaco),
