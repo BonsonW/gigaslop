@@ -11,11 +11,11 @@
 # qkv -> rotary emb dims
 [[configs]]
 M = 256
-N = 512
-K = 1536
+N = 1536
+K = 512
 
 # gated mlp entry
 [[configs]]
 M = 256
-N = 512
-K = 4096
+N = 4096
+K = 512

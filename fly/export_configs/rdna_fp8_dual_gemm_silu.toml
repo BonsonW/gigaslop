@@ -1,0 +1,22 @@
+# Export configurations for rdna_fp8_dual_gemm_silu (Variant A) and
+# rdna_fp8_dual_gemm_silu_mxfp8 (Variant B).
+#
+# Run Variant A:
+#   python fly/export_fp8_dual_gemm_silu.py --config fly/export_configs/rdna_fp8_dual_gemm_silu.toml
+# Run Variant B:
+#   python fly/export_fp8_dual_gemm_silu_mxfp8.py --config fly/export_configs/rdna_fp8_dual_gemm_silu.toml
+#
+# Each [[configs]] entry compiles a separate HSACO + C header pair.
+# M is optional per entry; if omitted, uses the --M CLI arg (default 256).
+# N = K_out = inter_dim (half of fc1 output width = half of 2*inter_dim)
+# K = K_in  = model_dim (fc1 input width)
+#
+# Outputs:
+#   artifacts/rdna_fp8_dual_gemm_silu_N{N}_K{K}.hsaco + .h
+#   artifacts/rdna_fp8_ptq_K{N}.hsaco + .h
+#   artifacts/rdna_fp8_dual_gemm_silu_mxfp8_N{N}_K{K}.hsaco + .h
+
+[[configs]]
+M = 256
+N = 2048
+K = 512
