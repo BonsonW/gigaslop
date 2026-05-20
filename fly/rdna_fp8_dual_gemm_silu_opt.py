@@ -61,7 +61,7 @@ def compile_fp8_dual_gemm_silu_opt(
     group_m: int = 8,
 ):
     if tile_n is None:
-        tile_n = 256 if M >= 256 else 128
+        tile_n = 128  # dual GEMM has 2× accumulator pressure; tile_n=256 overflows 256 VGPR limit
     if k_unroll is None:
         k_unroll = 2  # always 2 — dual GEMM loop body is big enough to benefit
 

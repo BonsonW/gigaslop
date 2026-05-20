@@ -97,7 +97,7 @@ def compile_fp8_gemm(
     M: int,
     N: int,
     K: int,
-    tile_m: int = 32,
+    tile_m: int = None,
     tile_n: int = None,
     tile_k: int = 32,
     k_unroll: int = None,
@@ -119,7 +119,9 @@ def compile_fp8_gemm(
     Returns:
         launch(c, a_fp8_f32, b_shuf_f32, scale_a_per_token, scale_b_per_channel, stream)
     """
-    # Auto-select tile_n and k_unroll based on shape
+    # Auto-select tile config based on shape
+    if tile_m is None:
+        tile_m = 64 if M >= 256 else 32
     if tile_n is None:
         tile_n = 256 if M >= 256 else 128
     if k_unroll is None:

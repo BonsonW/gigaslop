@@ -36,8 +36,10 @@ from rdna_fp8_preshuffle_gemm import compile_fp8_gemm
 
 # ── Tile / wave auto-selection (mirrors compile_fp8_gemm) ─────────────────────
 
-def _compute_config(M: int, N: int, K: int, tile_m: int = 32) -> dict:
+def _compute_config(M: int, N: int, K: int, tile_m: int = None) -> dict:
     """Return tile/wave constants for the given shape, matching compile_fp8_gemm."""
+    if tile_m is None:
+        tile_m = 64 if M >= 256 else 32
     tile_n = 256 if M >= 256 else 128
 
     if tile_m >= 128 and tile_n >= 128:
