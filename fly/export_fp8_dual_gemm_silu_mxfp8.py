@@ -71,17 +71,23 @@ def _load_configs(path: str, default_m: int = 256) -> list[tuple[int, int, int]]
 
 def _compile_and_get_ir(M: int, N: int, K: int) -> str:
     launcher   = compile_fp8_dual_gemm_silu_mxfp8(M=M, N=N, K=K)
-    out_fp8    = torch.zeros(M, N, dtype=torch.uint8).cuda()
-    out_scale  = torch.zeros(M, N // 32, dtype=torch.uint8).cuda()
-    A          = torch.zeros(M, K, dtype=torch.uint8).cuda()
-    B_gate     = torch.zeros(N // 16, K // 16, 2, 16, 8, dtype=torch.uint8).cuda()
-    B_up       = torch.zeros(N // 16, K // 16, 2, 16, 8, dtype=torch.uint8).cuda()
-    scale_a    = torch.ones(M, dtype=torch.float32).cuda()
-    scale_bg   = torch.ones(N, dtype=torch.float32).cuda()
-    scale_bu   = torch.ones(N, dtype=torch.float32).cuda()
-    stream     = torch.cuda.current_stream()
-    launcher(out_fp8, out_scale, A, B_gate, B_up, scale_a, scale_bg, scale_bu, stream, M)
-    torch.cuda.synchronize()
+    out_fp8    = torch.zeros(M, N, dtype=torch.uint8)
+    out_scale  = torch.zeros(M, N // 32, dtype=torch.uint8)
+    A          = torch.zeros(M, K, dtype=torch.uint8)
+    B_gate     = torch.zeros(N // 16, K // 16, 2, 16, 8, dtype=torch.uint8)
+    B_up       = torch.zeros(N // 16, K // 16, 2, 16, 8, dtype=torch.uint8)
+    scale_a    = torch.zeros(M, dtype=torch.float32)
+    scale_bg   = torch.zeros(N, dtype=torch.float32)
+    scale_bu   = torch.zeros(N, dtype=torch.float32)
+    prev = os.environ.get("COMPILE_ONLY")
+    os.environ["COMPILE_ONLY"] = "1"
+    try:
+        launcher(out_fp8, out_scale, A, B_gate, B_up, scale_a, scale_bg, scale_bu, 0, M)
+    finally:
+        if prev is None:
+            os.environ.pop("COMPILE_ONLY", None)
+        else:
+            os.environ["COMPILE_ONLY"] = prev
     artifacts = list(launcher._mem_cache.values())
     if not artifacts:
         raise RuntimeError("_mem_cache is empty after MXFP8 compilation")
@@ -229,9 +235,6 @@ static inline int fp8_dual_silu_mxfp8_wrapper(
     return 0;
 }}
 """
-
-_BYTES_PER_LINE = 16
-
 
 def _write_text(path: str, content: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)

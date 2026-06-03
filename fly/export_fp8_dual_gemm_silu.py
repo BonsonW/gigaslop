@@ -36,7 +36,7 @@ from rdna_fp8_per_token_quantize import compile_fp8_per_token_quantize
 # ── Tile / wave config (mirrors compile_fp8_dual_gemm_silu) ───────────────────
 
 def _compute_config_gemm(M: int, N: int, K: int, tile_m: int = 32) -> dict:
-    tile_n = 256 if M >= 256 else 128
+    tile_n = 128  # opt kernel fixes tile_n=128 to avoid dual-accumulator VGPR overflow
     if tile_m >= 128 and tile_n >= 128:
         waves_m, waves_n = 2, 2
     elif tile_m >= 64 and tile_n >= 128:
@@ -73,16 +73,22 @@ def _load_configs(path: str, default_m: int = 256) -> list[tuple[int, int, int]]
 
 def _compile_and_get_ir_gemm(M: int, N: int, K: int) -> str:
     launcher  = compile_fp8_dual_gemm_silu(M=M, N=N, K=K)
-    C         = torch.zeros(M, N, dtype=torch.float16).cuda()
-    A         = torch.zeros(M, K, dtype=torch.uint8).cuda()
-    B_gate    = torch.zeros(N // 16, K // 16, 2, 16, 8, dtype=torch.uint8).cuda()
-    B_up      = torch.zeros(N // 16, K // 16, 2, 16, 8, dtype=torch.uint8).cuda()
-    scale_a   = torch.ones(M, dtype=torch.float32).cuda()
-    scale_bg  = torch.ones(N, dtype=torch.float32).cuda()
-    scale_bu  = torch.ones(N, dtype=torch.float32).cuda()
-    stream    = torch.cuda.current_stream()
-    launcher(C, A, B_gate, B_up, scale_a, scale_bg, scale_bu, stream, M)
-    torch.cuda.synchronize()
+    C         = torch.zeros(M, N, dtype=torch.float16)
+    A         = torch.zeros(M, K, dtype=torch.uint8)
+    B_gate    = torch.zeros(N // 16, K // 16, 2, 16, 8, dtype=torch.uint8)
+    B_up      = torch.zeros(N // 16, K // 16, 2, 16, 8, dtype=torch.uint8)
+    scale_a   = torch.zeros(M, dtype=torch.float32)
+    scale_bg  = torch.zeros(N, dtype=torch.float32)
+    scale_bu  = torch.zeros(N, dtype=torch.float32)
+    prev = os.environ.get("COMPILE_ONLY")
+    os.environ["COMPILE_ONLY"] = "1"
+    try:
+        launcher(C, A, B_gate, B_up, scale_a, scale_bg, scale_bu, 0, M)
+    finally:
+        if prev is None:
+            os.environ.pop("COMPILE_ONLY", None)
+        else:
+            os.environ["COMPILE_ONLY"] = prev
     artifacts = list(launcher._mem_cache.values())
     if not artifacts:
         raise RuntimeError("_mem_cache is empty after dual-GEMM compilation")
@@ -92,12 +98,18 @@ def _compile_and_get_ir_gemm(M: int, N: int, K: int) -> str:
 def _compile_and_get_ir_ptq(M: int, K: int) -> str:
     """K is the row width (= N from the preceding GEMM)."""
     launcher  = compile_fp8_per_token_quantize(K=K)
-    out_fp8   = torch.zeros(M, K, dtype=torch.uint8).cuda()
-    out_scale = torch.zeros(M, dtype=torch.float32).cuda()
-    inp       = torch.zeros(M, K, dtype=torch.float16).cuda()
-    stream    = torch.cuda.current_stream()
-    launcher(out_fp8, out_scale, inp, M, stream)
-    torch.cuda.synchronize()
+    out_fp8   = torch.zeros(M, K, dtype=torch.uint8)
+    out_scale = torch.zeros(M, dtype=torch.float32)
+    inp       = torch.zeros(M, K, dtype=torch.float16)
+    prev = os.environ.get("COMPILE_ONLY")
+    os.environ["COMPILE_ONLY"] = "1"
+    try:
+        launcher(out_fp8, out_scale, inp, M, 0)
+    finally:
+        if prev is None:
+            os.environ.pop("COMPILE_ONLY", None)
+        else:
+            os.environ["COMPILE_ONLY"] = prev
     artifacts = list(launcher._mem_cache.values())
     if not artifacts:
         raise RuntimeError("_mem_cache is empty after PTQ compilation")
@@ -316,9 +328,6 @@ static inline int fp8_ptq_wrapper(
     return 0;
 }}
 """
-
-_BYTES_PER_LINE = 16
-
 
 def _write_text(path: str, content: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)

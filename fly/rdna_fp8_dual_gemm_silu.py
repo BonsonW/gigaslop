@@ -13,10 +13,11 @@ using preshuffle_b_fp8() (or split_and_preshuffle_fc1() for a combined fc1 weigh
 Grid:  (grid_m * grid_n, 1, 1)
 Block: (THREADS_PER_BLOCK, 1, 1)
 
-Compared to rdna_fp8_preshuffle_gemm, the kernel:
-  - Accepts two B matrices (B_gate, B_up) and three scale tensors
-  - Maintains two accumulator sets (gate_accs, up_accs)
-  - In the epilogue applies silu(gate) * up before converting to fp16
+Optimisations vs the naive dual-GEMM loop:
+1. Interleaved WMMA — gate[i] and up[i] WMMAs are emitted back-to-back so the
+   GPU's WMMA pipeline can overlap independent dependency chains and hide latency.
+2. k_unroll=2 for all M — the dual-GEMM loop body is 2x bigger so the extra
+   unrolling pays off for pipeline fill even at large M.
 """
 
 import functools
@@ -35,7 +36,6 @@ WMMA_K = 16
 # Host-side preshuffle / weight-prep helpers
 # =============================================================================
 
-
 def preshuffle_b_fp8(B_kn):
     """Preshuffle B[K, N] fp8 for WMMA B operand layout.
 
@@ -45,10 +45,8 @@ def preshuffle_b_fp8(B_kn):
 
     K, N = B_kn.shape
     assert K % 16 == 0 and N % 16 == 0
-    N0 = N // 16
-    K0 = K // 16
     B_view = B_kn.view(torch.uint8)
-    B_reshaped = B_view.reshape(K0, 2, 8, N0, 16)
+    B_reshaped = B_view.reshape(K // 16, 2, 8, N // 16, 16)
     return B_reshaped.permute(3, 0, 1, 4, 2).contiguous()  # [N0, K0, 2, 16, 8]
 
 
@@ -68,7 +66,6 @@ def split_and_preshuffle_fc1(W_kn):
 # =============================================================================
 # Kernel compiler
 # =============================================================================
-
 
 @functools.lru_cache(maxsize=64)
 def compile_fp8_dual_gemm_silu(
@@ -90,9 +87,9 @@ def compile_fp8_dual_gemm_silu(
     Returns launcher(c, a, b_gate, b_up, scale_a, scale_b_gate, scale_b_up, stream, m).
     """
     if tile_n is None:
-        tile_n = 256 if M >= 256 else 128
+        tile_n = 128  # dual GEMM has 2× accumulator pressure; tile_n=256 overflows 256 VGPR limit
     if k_unroll is None:
-        k_unroll = 1 if M >= 256 else 2
+        k_unroll = 2  # always 2 — dual GEMM loop body is big enough to benefit
 
     WAVE_SIZE = 32
     assert tile_m % WMMA_M == 0
@@ -130,7 +127,6 @@ def compile_fp8_dual_gemm_silu(
 
     K0_total = K // 16
 
-    # B preshuffle strides (byte-based for fp8)
     B_KPACK = 8
     B_STRIDE_NLANE = B_KPACK
     B_STRIDE_KLANE = 16 * B_KPACK
@@ -156,7 +152,6 @@ def compile_fp8_dual_gemm_silu(
         lane16 = lane % 16
         klane = lane // 16
 
-        # L2 cache swizzle
         pid_i32     = fx.arith.index_cast(fx.T.i32(), pid)
         group_m_cst = fx.arith.constant(group_m, type=fx.T.i32())
         grid_n_cst  = fx.arith.constant(grid_n,  type=fx.T.i32())
@@ -178,13 +173,13 @@ def compile_fp8_dual_gemm_silu(
         tile_m0 = bid_m * tile_m
         tile_n0 = bid_n * tile_n
 
-        a_rsrc      = buffer_ops.create_buffer_resource(arg_a,        max_size=True)
-        b_gate_rsrc = buffer_ops.create_buffer_resource(arg_b_gate,   max_size=True)
-        b_up_rsrc   = buffer_ops.create_buffer_resource(arg_b_up,     max_size=True)
-        c_rsrc      = buffer_ops.create_buffer_resource(arg_c,        max_size=True)
-        scale_a_rsrc      = buffer_ops.create_buffer_resource(arg_scale_a,      max_size=True)
+        a_rsrc            = buffer_ops.create_buffer_resource(arg_a,          max_size=True)
+        b_gate_rsrc       = buffer_ops.create_buffer_resource(arg_b_gate,     max_size=True)
+        b_up_rsrc         = buffer_ops.create_buffer_resource(arg_b_up,       max_size=True)
+        c_rsrc            = buffer_ops.create_buffer_resource(arg_c,          max_size=True)
+        scale_a_rsrc      = buffer_ops.create_buffer_resource(arg_scale_a,    max_size=True)
         scale_b_gate_rsrc = buffer_ops.create_buffer_resource(arg_scale_b_gate, max_size=True)
-        scale_b_up_rsrc   = buffer_ops.create_buffer_resource(arg_scale_b_up,   max_size=True)
+        scale_b_up_rsrc   = buffer_ops.create_buffer_resource(arg_scale_b_up, max_size=True)
 
         def _load_a_tile(k_tile_idx):
             a_vecs = []
@@ -194,8 +189,7 @@ def compile_fp8_dual_gemm_silu(
                 for rm in range_constexpr(wave_reg_m):
                     row = tile_m0 + wave_m * (wave_reg_m * WMMA_M) + 16 * rm + lane16
                     byte_off = row * K + col_base
-                    dword_off = byte_off // 4
-                    a_raw = buffer_ops.buffer_load(a_rsrc, dword_off, vec_width=2, dtype=fx.Int32)
+                    a_raw = buffer_ops.buffer_load(a_rsrc, byte_off // 4, vec_width=2, dtype=fx.Int32)
                     rk_vecs.append(a_raw)
                 a_vecs.append(rk_vecs)
             return a_vecs
@@ -214,31 +208,35 @@ def compile_fp8_dual_gemm_silu(
                         + klane * B_STRIDE_KLANE
                         + lane16 * B_STRIDE_NLANE
                     )
-                    dword_off = byte_off // 4
-                    b_raw = buffer_ops.buffer_load(b_rsrc, dword_off, vec_width=2, dtype=fx.Int32)
+                    b_raw = buffer_ops.buffer_load(b_rsrc, byte_off // 4, vec_width=2, dtype=fx.Int32)
                     rk_vecs.append(b_raw)
                 b_vecs.append(rk_vecs)
             return b_vecs
 
-        def _do_compute(accs_in, a_vecs, b_vecs):
-            new_accs = list(accs_in)
+        def _do_compute_both(gate_accs_in, up_accs_in, a_vecs, b_gate_vecs, b_up_vecs):
+            """Interleave gate[i] and up[i] WMMAs — hides WMMA pipeline latency."""
+            new_gate = list(gate_accs_in)
+            new_up   = list(up_accs_in)
             for rk in range_constexpr(reg_k):
                 for rm in range_constexpr(wave_reg_m):
                     for rn in range_constexpr(wave_reg_n):
                         idx = rm * wave_reg_n + rn
-                        new_accs[idx] = rocdl.wmma_f32_16x16x16_fp8_fp8(
-                            new_accs[idx].type,
-                            a_vecs[rk][rm],
-                            b_vecs[rk][rn],
-                            new_accs[idx],
+                        new_gate[idx] = rocdl.wmma_f32_16x16x16_fp8_fp8(
+                            new_gate[idx].type,
+                            a_vecs[rk][rm], b_gate_vecs[rk][rn],
+                            new_gate[idx],
                         ).result
-            return new_accs
+                        new_up[idx] = rocdl.wmma_f32_16x16x16_fp8_fp8(
+                            new_up[idx].type,
+                            a_vecs[rk][rm], b_up_vecs[rk][rn],
+                            new_up[idx],
+                        ).result
+            return new_gate, new_up
 
-        zero_acc = fx.full(8, 0.0, fx.Float32)
+        zero_acc  = fx.full(8, 0.0, fx.Float32)
         gate_accs = [zero_acc for _ in range_constexpr(wave_reg_m * wave_reg_n)]
         up_accs   = [zero_acc for _ in range_constexpr(wave_reg_m * wave_reg_n)]
 
-        # Software-pipelined K-loop (shared A, two B matrices)
         a_cur      = _load_a_tile(0)
         b_gate_cur = _load_b_tile(0, b_gate_rsrc)
         b_up_cur   = _load_b_tile(0, b_up_rsrc)
@@ -253,24 +251,20 @@ def compile_fp8_dual_gemm_silu(
             return flat
 
         def _unflatten_a(flat):
-            out = []
-            idx = 0
+            out, idx = [], 0
             for _rk in range_constexpr(reg_k):
                 row = []
                 for _rm in range_constexpr(wave_reg_m):
-                    row.append(flat[idx])
-                    idx += 1
+                    row.append(flat[idx]); idx += 1
                 out.append(row)
             return out
 
         def _unflatten_b(flat):
-            out = []
-            idx = 0
+            out, idx = [], 0
             for _rk in range_constexpr(reg_k):
                 row = []
                 for _rn in range_constexpr(wave_reg_n):
-                    row.append(flat[idx])
-                    idx += 1
+                    row.append(flat[idx]); idx += 1
                 out.append(row)
             return out
 
@@ -289,18 +283,17 @@ def compile_fp8_dual_gemm_silu(
         if const_expr(full_outer_iters > 0):
             for iv, state in range(0, full_outer_iters * k_unroll, k_unroll, init=init_state):
                 s_a      = _unflatten_a(list(state[:n_a]))
-                s_gate   = list(state[n_a            : n_a + n_acc])
-                s_up     = list(state[n_a + n_acc    : n_a + 2 * n_acc])
-                s_b_gate = _unflatten_b(list(state[n_a + 2 * n_acc          : n_a + 2 * n_acc + n_b]))
-                s_b_up   = _unflatten_b(list(state[n_a + 2 * n_acc + n_b    :]))
+                s_gate   = list(state[n_a              : n_a + n_acc])
+                s_up     = list(state[n_a + n_acc      : n_a + 2 * n_acc])
+                s_b_gate = _unflatten_b(list(state[n_a + 2 * n_acc         : n_a + 2 * n_acc + n_b]))
+                s_b_up   = _unflatten_b(list(state[n_a + 2 * n_acc + n_b   :]))
 
                 for j in range_constexpr(k_unroll):
-                    next_kt = iv + (j + 1)
+                    next_kt     = iv + (j + 1)
                     a_next      = _load_a_tile(next_kt)
                     b_gate_next = _load_b_tile(next_kt, b_gate_rsrc)
                     b_up_next   = _load_b_tile(next_kt, b_up_rsrc)
-                    s_gate = _do_compute(s_gate, s_a, s_b_gate)
-                    s_up   = _do_compute(s_up,   s_a, s_b_up)
+                    s_gate, s_up = _do_compute_both(s_gate, s_up, s_a, s_b_gate, s_b_up)
                     s_a      = _unflatten_a(_flatten_tile(a_next))
                     s_b_gate = _unflatten_b(_flatten_tile(b_gate_next))
                     s_b_up   = _unflatten_b(_flatten_tile(b_up_next))
@@ -314,25 +307,23 @@ def compile_fp8_dual_gemm_silu(
                 )
 
             a_cur      = _unflatten_a(list(results[:n_a]))
-            gate_accs  = list(results[n_a            : n_a + n_acc])
-            up_accs    = list(results[n_a + n_acc    : n_a + 2 * n_acc])
-            b_gate_cur = _unflatten_b(list(results[n_a + 2 * n_acc          : n_a + 2 * n_acc + n_b]))
-            b_up_cur   = _unflatten_b(list(results[n_a + 2 * n_acc + n_b    :]))
+            gate_accs  = list(results[n_a              : n_a + n_acc])
+            up_accs    = list(results[n_a + n_acc      : n_a + 2 * n_acc])
+            b_gate_cur = _unflatten_b(list(results[n_a + 2 * n_acc         : n_a + 2 * n_acc + n_b]))
+            b_up_cur   = _unflatten_b(list(results[n_a + 2 * n_acc + n_b   :]))
 
         if const_expr(remainder > 0):
             for j in range_constexpr(remainder):
-                next_kt = full_outer_iters * k_unroll + j + 1
+                next_kt     = full_outer_iters * k_unroll + j + 1
                 a_next      = _load_a_tile(next_kt)
                 b_gate_next = _load_b_tile(next_kt, b_gate_rsrc)
                 b_up_next   = _load_b_tile(next_kt, b_up_rsrc)
-                gate_accs = _do_compute(gate_accs, a_cur, b_gate_cur)
-                up_accs   = _do_compute(up_accs,   a_cur, b_up_cur)
+                gate_accs, up_accs = _do_compute_both(gate_accs, up_accs, a_cur, b_gate_cur, b_up_cur)
                 a_cur      = _unflatten_a(_flatten_tile(a_next))
                 b_gate_cur = _unflatten_b(_flatten_tile(b_gate_next))
                 b_up_cur   = _unflatten_b(_flatten_tile(b_up_next))
 
-        gate_accs = _do_compute(gate_accs, a_cur, b_gate_cur)
-        up_accs   = _do_compute(up_accs,   a_cur, b_up_cur)
+        gate_accs, up_accs = _do_compute_both(gate_accs, up_accs, a_cur, b_gate_cur, b_up_cur)
 
         # Epilogue: silu(gate) * up → fp16
         neg_log2e = arith.constant(-1.4426950408889634, type=fx.T.f32())
@@ -354,10 +345,10 @@ def compile_fp8_dual_gemm_silu(
                 sa_cache.append(buffer_ops.buffer_load(scale_a_rsrc, g_row_si, vec_width=1, dtype=fx.Float32))
 
             for rn in range_constexpr(wave_reg_n):
-                idx      = rm * wave_reg_n + rn
+                idx        = rm * wave_reg_n + rn
                 wmma_n_off = wave_n * (wave_reg_n * WMMA_N) + 16 * rn
-                sb_gate  = sb_gate_cache[rn]
-                sb_up    = sb_up_cache[rn]
+                sb_gate    = sb_gate_cache[rn]
+                sb_up      = sb_up_cache[rn]
 
                 for si in range_constexpr(8):
                     g_row = tile_m0 + wmma_m_off + base8 + si
@@ -367,7 +358,6 @@ def compile_fp8_dual_gemm_silu(
                     gate_val = ArithValue(gate_accs[idx][si]) * sa * sb_gate
                     up_val   = ArithValue(up_accs[idx][si])   * sa * sb_up
 
-                    # SiLU(gate) * up
                     emu     = ArithValue(rocdl.exp2(fx.T.f32(), gate_val * neg_log2e))
                     sig     = ArithValue(rocdl.rcp(fx.T.f32(), c1_f32 + emu))
                     act_val = gate_val * sig * up_val
@@ -388,8 +378,8 @@ def compile_fp8_dual_gemm_silu(
         stream: fx.Stream,
         m: fx.Int32,
     ):
-        c1          = 1
-        dyn_grid_m  = m // tile_m
+        c1           = 1
+        dyn_grid_m   = m // tile_m
         total_blocks = dyn_grid_m * grid_n
         launcher = kernel_dual_gemm_silu(
             arg_c, arg_a, arg_b_gate, arg_b_up,

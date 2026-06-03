@@ -58,18 +58,22 @@ def _compile_and_get_ir(M, N, K, nhead, head_dim, rotary_dim):
         nhead=nhead, head_dim=head_dim,
         rotary_dim=rotary_dim,
     )
-    C       = torch.zeros(M, N, dtype=torch.float16).cuda()
-    A       = torch.zeros(M, K, dtype=torch.uint8).cuda()
-    B_shuf  = torch.zeros(N // 16, K // 16, 2, 16, 8, dtype=torch.uint8).cuda()
-    scale_a = torch.ones(M, dtype=torch.float32).cuda()
-    scale_b = torch.ones(N, dtype=torch.float32).cuda()
-    sin_buf = torch.zeros(dummy_seqlen, rotary_half, dtype=torch.float32).cuda()
-    cos_buf = torch.ones(dummy_seqlen, rotary_half, dtype=torch.float32).cuda()
-    stream  = torch.cuda.current_stream()
-
-    launcher(C, A, B_shuf, scale_a, scale_b, sin_buf, cos_buf, stream, M, dummy_seqlen)
-    torch.cuda.synchronize()
-
+    C       = torch.zeros(M, N, dtype=torch.float16)
+    A       = torch.zeros(M, K, dtype=torch.uint8)
+    B_shuf  = torch.zeros(N // 16, K // 16, 2, 16, 8, dtype=torch.uint8)
+    scale_a = torch.zeros(M, dtype=torch.float32)
+    scale_b = torch.zeros(N, dtype=torch.float32)
+    sin_buf = torch.zeros(dummy_seqlen, rotary_half, dtype=torch.float32)
+    cos_buf = torch.zeros(dummy_seqlen, rotary_half, dtype=torch.float32)
+    prev = os.environ.get("COMPILE_ONLY")
+    os.environ["COMPILE_ONLY"] = "1"
+    try:
+        launcher(C, A, B_shuf, scale_a, scale_b, sin_buf, cos_buf, 0, M, dummy_seqlen)
+    finally:
+        if prev is None:
+            os.environ.pop("COMPILE_ONLY", None)
+        else:
+            os.environ["COMPILE_ONLY"] = prev
     artifacts = list(launcher._mem_cache.values())
     if not artifacts:
         raise RuntimeError("_mem_cache is empty after compilation")
