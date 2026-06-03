@@ -1,0 +1,3 @@
+[submodule "openfish"]
+	path = openfish
+	url = https://github.com/warp9seq/openfish.git
