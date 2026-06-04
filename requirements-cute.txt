@@ -1,0 +1,5 @@
+# cute / CuTe — CUTLASS kernel work (separate CUDA setup)
+
+torch
+cutlass
+numpy

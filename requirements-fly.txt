@@ -1,0 +1,10 @@
+# fly / FlyDSL — ROCm kernel DSL work
+# See requirements-cute.txt for the CUTLASS/CuTe setup (separate environment)
+#
+# Install with:
+#   pip install -r requirements-fly.txt --index-url https://download.pytorch.org/whl/rocm7.2
+
+--index-url https://download.pytorch.org/whl/rocm7.2
+torch
+flydsl==0.1.8
+numpy
