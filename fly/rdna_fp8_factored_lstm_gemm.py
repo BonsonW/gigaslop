@@ -36,6 +36,7 @@ WMMA_K = 16   # fp8 WMMA K-size (only variant on gfx1201)
 
 WAVE_SIZE = 32
 SHUFFLE_DISTS = [1, 2, 4, 8, 16]
+FP8_MAX   = 448.0
 
 
 # =============================================================================
@@ -94,6 +95,7 @@ def compile_fp8_factored_lstm_gemm(
     k_unroll: int = 2,
     tile_k2: int = 16,   # fp8 WMMA K=16
     group_m: int = 8,
+    nh_per_block: int = 4,   # H-tiles processed per block (Phase 1 computed once per M-tile)
 ):
     """Compile fused factored LSTM GEMM for gfx1201.
 
@@ -128,6 +130,9 @@ def compile_fp8_factored_lstm_gemm(
     num_k1_tiles = H // tile_k1
     grid_m       = B // tile_m
     grid_h       = H // tile_n_h
+    assert grid_h % nh_per_block == 0, (
+        f"grid_h={grid_h} must be divisible by nh_per_block={nh_per_block}")
+    grid_h_outer = grid_h // nh_per_block   # H-tile groups (blocks along H)
 
     # ── Phase 2 tile dimensions ──────────────────────────────────────────────
     reg_k2       = tile_k2 // WMMA_K   # 1
@@ -161,7 +166,7 @@ def compile_fp8_factored_lstm_gemm(
 
     @flyc.kernel
     def kernel_factored_lstm(
-        arg_h_fp16_out: fx.Tensor,   # [B, H]   f16  — output h[t+1]
+        arg_h_fp8_out:  fx.Tensor,   # [B, H]   fp8 (uint8) — output h[t+1], fixed scale 1/448
         arg_c_inout:    fx.Tensor,   # [B, H]   f32  — cell state in-place
         arg_hh:         fx.Tensor,   # [B, H]   fp8  — input h[t]
         arg_scale_hh:   fx.Tensor,   # [B]      f32  — per-token scale for hh
@@ -181,32 +186,31 @@ def compile_fp8_factored_lstm_gemm(
         klane   = lane // 16
 
         pid_i32   = fx.arith.index_cast(fx.T.i32(), pid)
-        grid_h_c  = fx.arith.constant(grid_h,  type=fx.T.i32())
+        grid_h_c  = fx.arith.constant(grid_h_outer, type=fx.T.i32())
         group_m_c = fx.arith.constant(group_m, type=fx.T.i32())
         eff_gm    = fx.arith.select(
             fx.arith.cmpi(fx.arith.CmpIPredicate.slt, arg_grid_m, group_m_c),
             arg_grid_m, group_m_c,
         )
-        num_in_group = eff_gm * grid_h_c
-        group_id     = pid_i32 // num_in_group
-        pid_in_group = pid_i32 % num_in_group
-        bid_m_i32    = group_id * eff_gm + pid_in_group % eff_gm
-        bid_h_i32    = pid_in_group // eff_gm
-        bid_m        = fx.arith.index_cast(fx.T.index(), bid_m_i32)
-        bid_h        = fx.arith.index_cast(fx.T.index(), bid_h_i32)
+        num_in_group   = eff_gm * grid_h_c
+        group_id       = pid_i32 // num_in_group
+        pid_in_group   = pid_i32 % num_in_group
+        bid_m_i32      = group_id * eff_gm + pid_in_group % eff_gm
+        bid_ho_i32     = pid_in_group // eff_gm
+        bid_m          = fx.arith.index_cast(fx.T.index(), bid_m_i32)
+        bid_h_outer    = fx.arith.index_cast(fx.T.index(), bid_ho_i32)
 
         wave_m = wave_id // waves_n
         wave_n = wave_id % waves_n
 
         tile_m0  = bid_m * tile_m
-        tile_nh0 = bid_h * tile_n_h
 
         # ── Buffer resources ─────────────────────────────────────────────────
         hh_rsrc   = buffer_ops.create_buffer_resource(arg_hh,        max_size=True)
         dn_rsrc   = buffer_ops.create_buffer_resource(arg_dn_weight, max_size=True)
         up_rsrc   = buffer_ops.create_buffer_resource(arg_up_weight, max_size=True)
         c_rsrc    = buffer_ops.create_buffer_resource(arg_c_inout,   max_size=True)
-        h_rsrc    = buffer_ops.create_buffer_resource(arg_h_fp16_out,max_size=True)
+        h_rsrc    = buffer_ops.create_buffer_resource(arg_h_fp8_out, max_size=True)
         shh_rsrc  = buffer_ops.create_buffer_resource(arg_scale_hh,  max_size=True)
         sdn_rsrc  = buffer_ops.create_buffer_resource(arg_scale_dn,  max_size=True)
         bias_rsrc = buffer_ops.create_buffer_resource(arg_bias,      max_size=True)
@@ -395,27 +399,8 @@ def compile_fp8_factored_lstm_gemm(
             return ni, nf, ng, no
 
         n_ac2 = wave_reg_m * wave_reg_n_h
-        i_ac  = [zero_acc for _ in range_constexpr(n_ac2)]
-        f_ac  = [zero_acc for _ in range_constexpr(n_ac2)]
-        g_ac  = [zero_acc for _ in range_constexpr(n_ac2)]
-        o_ac  = [zero_acc for _ in range_constexpr(n_ac2)]
 
-        h_tile_n0 = bid_h * (tile_n_h // 16)
-        gate_n0_i = h_tile_n0 + 0 * GATE2_N0_STRIDE
-        gate_n0_f = h_tile_n0 + 1 * GATE2_N0_STRIDE
-        gate_n0_g = h_tile_n0 + 2 * GATE2_N0_STRIDE
-        gate_n0_o = h_tile_n0 + 3 * GATE2_N0_STRIDE
-
-        for kt2 in range_constexpr(num_k2_tiles):
-            a2   = _load_a2(kt2)
-            bi_v = _load_b2(kt2, gate_n0_i)
-            bf_v = _load_b2(kt2, gate_n0_f)
-            bg_v = _load_b2(kt2, gate_n0_g)
-            bo_v = _load_b2(kt2, gate_n0_o)
-            i_ac, f_ac, g_ac, o_ac = _compute2(
-                i_ac, f_ac, g_ac, o_ac, a2, bi_v, bf_v, bg_v, bo_v)
-
-        # ── Phase 3: LSTM epilogue ────────────────────────────────────────────
+        # ── Phase 3 epilogue constants (H-invariant, hoisted above the H-loop) ──
         c0_2  = arith.constant(0.2,  type=fx.T.f32())
         c0_5  = arith.constant(0.5,  type=fx.T.f32())
         c0_0  = arith.constant(0.0,  type=fx.T.f32())
@@ -423,68 +408,101 @@ def compile_fp8_factored_lstm_gemm(
         cm1_0 = arith.constant(-1.0, type=fx.T.f32())
         c2_0  = arith.constant(2.0,  type=fx.T.f32())
         nl2e  = arith.constant(-1.4426950408889634, type=fx.T.f32())
+        # Fixed-scale fp8 output: h_new ∈ [-1,1] maps onto e4m3 [-448,448] exactly.
+        c448     = arith.constant(FP8_MAX, type=fx.T.f32())
+        zero_i32 = arith.constant(0, type=fx.T.i32())
 
-        wave_nh0 = tile_nh0 + wave_n * (wave_reg_n_h * WMMA_N)
+        def sighard(x):
+            return ArithValue(arith.minimumf(
+                (x * c0_2 + c0_5).maximumf(c0_0), c1_0))
 
-        def _bias(g, rn):
-            h_col = wave_nh0 + 16 * rn + lane16
-            return ArithValue(buffer_ops.buffer_load(
-                bias_rsrc, g * H + h_col, vec_width=1, dtype=fx.Float32))
+        # ── Phase 2 + Phase 3 over each H-tile this block owns (Phase 1 shared) ─
+        for hj in range_constexpr(nh_per_block):
+            bid_h     = bid_h_outer * nh_per_block + hj
+            tile_nh0  = bid_h * tile_n_h
+            h_tile_n0 = bid_h * (tile_n_h // 16)
+            gate_n0_i = h_tile_n0 + 0 * GATE2_N0_STRIDE
+            gate_n0_f = h_tile_n0 + 1 * GATE2_N0_STRIDE
+            gate_n0_g = h_tile_n0 + 2 * GATE2_N0_STRIDE
+            gate_n0_o = h_tile_n0 + 3 * GATE2_N0_STRIDE
 
-        bias_i = [_bias(0, rn) for rn in range_constexpr(wave_reg_n_h)]
-        bias_f = [_bias(1, rn) for rn in range_constexpr(wave_reg_n_h)]
-        bias_g = [_bias(2, rn) for rn in range_constexpr(wave_reg_n_h)]
-        bias_o = [_bias(3, rn) for rn in range_constexpr(wave_reg_n_h)]
+            # Fresh accumulators each H-tile (registers reused across iterations).
+            i_ac = [zero_acc for _ in range_constexpr(n_ac2)]
+            f_ac = [zero_acc for _ in range_constexpr(n_ac2)]
+            g_ac = [zero_acc for _ in range_constexpr(n_ac2)]
+            o_ac = [zero_acc for _ in range_constexpr(n_ac2)]
 
-        for rm in range_constexpr(wave_reg_m):
-            wmma_m_off = wave_m_off + 16 * rm
+            for kt2 in range_constexpr(num_k2_tiles):
+                a2   = _load_a2(kt2)
+                bi_v = _load_b2(kt2, gate_n0_i)
+                bf_v = _load_b2(kt2, gate_n0_f)
+                bg_v = _load_b2(kt2, gate_n0_g)
+                bo_v = _load_b2(kt2, gate_n0_o)
+                i_ac, f_ac, g_ac, o_ac = _compute2(
+                    i_ac, f_ac, g_ac, o_ac, a2, bi_v, bf_v, bg_v, bo_v)
 
-            for rn in range_constexpr(wave_reg_n_h):
-                idx   = rm * wave_reg_n_h + rn
-                h_col = wave_nh0 + 16 * rn + lane16
+            wave_nh0 = tile_nh0 + wave_n * (wave_reg_n_h * WMMA_N)
 
-                for si in range_constexpr(8):
-                    g_row = tile_m0 + wmma_m_off + base8 + si
+            def _bias(g, rn, _wave_nh0=wave_nh0):
+                h_col = _wave_nh0 + 16 * rn + lane16
+                return ArithValue(buffer_ops.buffer_load(
+                    bias_rsrc, g * H + h_col, vec_width=1, dtype=fx.Float32))
 
-                    ih_row_base = g_row * (4 * H) + h_col
-                    def _ih_f32(gate_off):
-                        return ArithValue(buffer_ops.buffer_load(
-                            ih_rsrc, ih_row_base + gate_off,
-                            vec_width=1, dtype=fx.Float16)).extf(fx.T.f32())
+            bias_i = [_bias(0, rn) for rn in range_constexpr(wave_reg_n_h)]
+            bias_f = [_bias(1, rn) for rn in range_constexpr(wave_reg_n_h)]
+            bias_g = [_bias(2, rn) for rn in range_constexpr(wave_reg_n_h)]
+            bias_o = [_bias(3, rn) for rn in range_constexpr(wave_reg_n_h)]
 
-                    # Phase 2 uses actual f16 weights → no descaling needed
-                    i_raw = ArithValue(i_ac[idx][si]) + bias_i[rn] + _ih_f32(0 * H)
-                    f_raw = ArithValue(f_ac[idx][si]) + bias_f[rn] + _ih_f32(1 * H)
-                    g_raw = ArithValue(g_ac[idx][si]) + bias_g[rn] + _ih_f32(2 * H)
-                    o_raw = ArithValue(o_ac[idx][si]) + bias_o[rn] + _ih_f32(3 * H)
+            for rm in range_constexpr(wave_reg_m):
+                wmma_m_off = wave_m_off + 16 * rm
 
-                    def sighard(x):
-                        return ArithValue(arith.minimumf(
-                            (x * c0_2 + c0_5).maximumf(c0_0), c1_0))
+                for rn in range_constexpr(wave_reg_n_h):
+                    idx   = rm * wave_reg_n_h + rn
+                    h_col = wave_nh0 + 16 * rn + lane16
 
-                    i_a = sighard(i_raw)
-                    f_a = sighard(f_raw)
-                    g_a = ArithValue(arith.minimumf(g_raw.maximumf(cm1_0), c1_0))
-                    o_a = sighard(o_raw)
+                    for si in range_constexpr(8):
+                        g_row = tile_m0 + wmma_m_off + base8 + si
 
-                    c_off = g_row * H + h_col
-                    c_val = ArithValue(buffer_ops.buffer_load(
-                        c_rsrc, c_off, vec_width=1, dtype=fx.Float32))
-                    c_new = f_a * c_val + i_a * g_a
-                    buffer_ops.buffer_store(c_new, c_rsrc, c_off)
+                        ih_row_base = g_row * (4 * H) + h_col
+                        def _ih_f32(gate_off, _b=ih_row_base):
+                            return ArithValue(buffer_ops.buffer_load(
+                                ih_rsrc, _b + gate_off,
+                                vec_width=1, dtype=fx.Float16)).extf(fx.T.f32())
 
-                    emu    = ArithValue(rocdl.exp2(fx.T.f32(), c_new * c2_0 * nl2e))
-                    sig2   = ArithValue(rocdl.rcp(fx.T.f32(), c1_0 + emu))
-                    tanh_c = c2_0 * sig2 - c1_0
+                        # Phase 2 uses actual f16 weights → no descaling needed
+                        i_raw = ArithValue(i_ac[idx][si]) + bias_i[rn] + _ih_f32(0 * H)
+                        f_raw = ArithValue(f_ac[idx][si]) + bias_f[rn] + _ih_f32(1 * H)
+                        g_raw = ArithValue(g_ac[idx][si]) + bias_g[rn] + _ih_f32(2 * H)
+                        o_raw = ArithValue(o_ac[idx][si]) + bias_o[rn] + _ih_f32(3 * H)
 
-                    h_new  = o_a * tanh_c
-                    h_fp16 = arith.truncf(fx.T.f16(), h_new)
-                    buffer_ops.buffer_store(h_fp16, h_rsrc, g_row * H + h_col)
+                        i_a = sighard(i_raw)
+                        f_a = sighard(f_raw)
+                        g_a = ArithValue(arith.minimumf(g_raw.maximumf(cm1_0), c1_0))
+                        o_a = sighard(o_raw)
+
+                        c_off = g_row * H + h_col
+                        c_val = ArithValue(buffer_ops.buffer_load(
+                            c_rsrc, c_off, vec_width=1, dtype=fx.Float32))
+                        c_new = f_a * c_val + i_a * g_a
+                        buffer_ops.buffer_store(c_new, c_rsrc, c_off)
+
+                        emu    = ArithValue(rocdl.exp2(fx.T.f32(), c_new * c2_0 * nl2e))
+                        sig2   = ArithValue(rocdl.rcp(fx.T.f32(), c1_0 + emu))
+                        tanh_c = c2_0 * sig2 - c1_0
+
+                        h_new    = o_a * tanh_c
+                        # Fixed-scale fp8: ×448, convert to e4m3, store low byte.
+                        h_scaled = h_new * ArithValue(c448)
+                        packed   = rocdl.cvt_pk_fp8_f32(
+                            fx.T.i32(), h_scaled, h_scaled, zero_i32, 0)
+                        h_fp8_b  = arith.trunci(fx.T.i8(), packed)
+                        buffer_ops.buffer_store(
+                            h_fp8_b, h_rsrc, g_row * H + h_col, offset_is_bytes=True)
 
     # ── Host launcher ─────────────────────────────────────────────────────────
     @flyc.jit
     def launch_fp8_factored_lstm(
-        arg_h_fp16_out: fx.Tensor,
+        arg_h_fp8_out:  fx.Tensor,
         arg_c_inout:    fx.Tensor,
         arg_hh:         fx.Tensor,
         arg_scale_hh:   fx.Tensor,
@@ -498,9 +516,9 @@ def compile_fp8_factored_lstm_gemm(
     ):
         c1           = 1
         dyn_grid_m   = m // tile_m
-        total_blocks = dyn_grid_m * grid_h
+        total_blocks = dyn_grid_m * grid_h_outer
         launcher = kernel_factored_lstm(
-            arg_h_fp16_out, arg_c_inout, arg_hh, arg_scale_hh,
+            arg_h_fp8_out, arg_c_inout, arg_hh, arg_scale_hh,
             arg_dn_weight, arg_scale_dn, arg_up_weight,
             arg_bias, arg_ih_t, dyn_grid_m,
         )

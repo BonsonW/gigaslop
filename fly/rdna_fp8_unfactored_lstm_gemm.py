@@ -115,7 +115,7 @@ def compile_fp8_unfactored_lstm_gemm(
     tile_n_h: int = 32,
     tile_k: int = 32,
     k_unroll: int = 2,
-    group_m: int = 1,
+    group_m: int = 8,   # block-schedule grouping for W_fused L2 reuse (~11% under graph replay)
 ):
     """Compile unfactored LSTM GEMM for gfx1201.
 
@@ -416,18 +416,28 @@ def compile_fp8_unfactored_lstm_gemm(
                 idx   = rm * wave_reg_n_h + rn
                 h_col = wave_nh0 + 16 * rn + lane16
 
-                for si in range_constexpr(8):
-                    g_row = tile_m0 + wmma_m_off + base8 + si
-                    s_hh  = ArithValue(shh_vals[si])
+                def sighard(x):
+                    return ArithValue(arith.minimumf(
+                        (x * c0_2 + c0_5).maximumf(c0_0), c1_0))
 
-                    # arg_ih_t is [B, H, 4] layout: stride H*4 per row, 4 per h_col.
-                    # Load all 4 gate values as one vec4_f16 (64-bit) instruction.
-                    ih_base = g_row * (H * 4) + h_col * 4
-                    ih_vec  = buffer_ops.buffer_load(
-                        ih_rsrc, ih_base, vec_width=4, dtype=fx.Float16)
-                    def _ih(gi):
+                # ── Phase A: issue ALL epilogue loads up front (memory-level parallelism).
+                # ih_t [B,H,4]: one vec4_f16 per row covers all 4 gates; c f32 read.
+                g_rows  = [tile_m0 + wmma_m_off + base8 + si for si in range_constexpr(8)]
+                ih_vecs = [buffer_ops.buffer_load(
+                    ih_rsrc, g_rows[si] * (H * 4) + h_col * 4, vec_width=4, dtype=fx.Float16)
+                    for si in range_constexpr(8)]
+                c_vals  = [ArithValue(buffer_ops.buffer_load(
+                    c_rsrc, g_rows[si] * H + h_col, vec_width=1, dtype=fx.Float32))
+                    for si in range_constexpr(8)]
+
+                # ── Phase B: compute + store (loads above pipeline behind this work).
+                for si in range_constexpr(8):
+                    g_row = g_rows[si]
+                    s_hh  = ArithValue(shh_vals[si])
+                    iv    = ih_vecs[si]
+                    def _ih(gi, _iv=iv):
                         return ArithValue(mlir_vector.extract(
-                            ih_vec, static_position=[gi], dynamic_position=[])).extf(fx.T.f32())
+                            _iv, static_position=[gi], dynamic_position=[])).extf(fx.T.f32())
 
                     # Descale: acc * scale_hh[row] * scale_wf[col] + bias + ih_t
                     i_raw = ArithValue(i_ac[idx][si]) * s_hh * swf_i[rn] + bias_i[rn] + _ih(0)
@@ -435,19 +445,13 @@ def compile_fp8_unfactored_lstm_gemm(
                     g_raw = ArithValue(g_ac[idx][si]) * s_hh * swf_g[rn] + bias_g[rn] + _ih(2)
                     o_raw = ArithValue(o_ac[idx][si]) * s_hh * swf_o[rn] + bias_o[rn] + _ih(3)
 
-                    def sighard(x):
-                        return ArithValue(arith.minimumf(
-                            (x * c0_2 + c0_5).maximumf(c0_0), c1_0))
-
                     i_a = sighard(i_raw)
                     f_a = sighard(f_raw)
                     g_a = ArithValue(arith.minimumf(g_raw.maximumf(cm1_0), c1_0))
                     o_a = sighard(o_raw)
 
                     c_off = g_row * H + h_col
-                    c_val = ArithValue(buffer_ops.buffer_load(
-                        c_rsrc, c_off, vec_width=1, dtype=fx.Float32))
-                    c_new = f_a * c_val + i_a * g_a
+                    c_new = f_a * c_vals[si] + i_a * g_a
                     buffer_ops.buffer_store(c_new, c_rsrc, c_off)
 
                     # Padé [3/2] tanh: x*(27+x²)/(27+9x²), ~3% max error, no exp2

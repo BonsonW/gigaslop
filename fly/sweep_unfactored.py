@@ -130,7 +130,7 @@ def main():
 
     inp = make_inputs(device)
 
-    tile_m_vals   = [32, 64, 128]
+    tile_m_vals   = [16, 32, 64, 128]
     tile_n_h_vals = [32, 64]
     tile_k_vals   = [16, 32]
     k_unroll_vals = [1, 2, 4, 8]

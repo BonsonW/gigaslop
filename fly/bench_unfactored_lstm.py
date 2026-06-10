@@ -75,7 +75,8 @@ def verify(B, device):
 
     launcher = compile_fp8_unfactored_lstm_gemm(B=B, H=H)
     h_fp8 = torch.zeros(B, H, dtype=torch.uint8, device=device)
-    c_inout = inp["c_inout"]
+    # Clone c so the in-place cell update doesn't corrupt inp["c_inout"] for the factored check.
+    c_inout = inp["c_inout"].clone()
     # Input hh keeps its own per-token scale; only the OUTPUT uses the fixed 1/448 scale.
     launcher(h_fp8, c_inout, inp["hh_fp8"], inp["scale_hh"],
              inp["wf_shuf"], inp["scale_wf"], inp["up_bias"], inp["ih_t_interleaved"],
@@ -88,9 +89,35 @@ def verify(B, device):
     c_err = (c_inout - c_ref).abs()
     h_ok  = h_err.max().item() < 0.08
     c_ok  = c_err.max().item() < 0.08
-    print(f"h_new  max err: {h_err.max().item():.5f}  {'PASS' if h_ok else 'FAIL'}")
-    print(f"c_new  max err: {c_err.max().item():.5f}  {'PASS' if c_ok else 'FAIL'}")
-    return h_ok and c_ok
+    print(f"[unfactored]  h_new max err: {h_err.max().item():.5f}  {'PASS' if h_ok else 'FAIL'}")
+    print(f"[unfactored]  c_new max err: {c_err.max().item():.5f}  {'PASS' if c_ok else 'FAIL'}")
+
+    # ── Factored kernel: also fused fp8 output (fixed scale 1/448) ──────────────
+    fac_ok = True
+    for nh in (1, 4, 8):
+        if (H // 32) % nh != 0:
+            continue
+        fac = compile_fp8_factored_lstm_gemm(B=B, H=H, R=R, nh_per_block=nh)
+        h_fp8_f = torch.zeros(B, H, dtype=torch.uint8, device=device)
+        c_f     = inp["c_inout"].clone()
+        fac(h_fp8_f, c_f, inp["hh_fp8"], inp["scale_hh"],
+            inp["dn_shuf"], inp["scale_dn"], inp["up_shuf_f16"],
+            inp["up_bias"], inp["ih_t_f16"], stream, B)
+        torch.cuda.synchronize()
+        h_out_f = h_fp8_f.view(torch.float8_e4m3fn).float() * (1.0 / 448.0)
+        h_e = (h_out_f - h_ref.float()).abs().max().item()
+        c_e = (c_f - c_ref).abs().max().item()
+        ok  = h_e < 0.08 and c_e < 0.08
+        fac_ok = fac_ok and ok
+        print(f"[factored nh={nh}]  h max err: {h_e:.5f}  c max err: {c_e:.5f}  {'PASS' if ok else 'FAIL'}")
+        if nh == 1:
+            h_fp8_ref_bits = h_fp8_f.clone()
+        else:
+            same = torch.equal(h_fp8_f, h_fp8_ref_bits)
+            print(f"[factored nh={nh}]  bitwise-identical to nh=1: {'YES' if same else 'NO'}")
+            fac_ok = fac_ok and same
+
+    return h_ok and c_ok and fac_ok
 
 
 def benchmark(B, device, warmup=20, iters=500):
@@ -110,53 +137,85 @@ def benchmark(B, device, warmup=20, iters=500):
     c_fac = inp["c_inout"].clone()
     c_unf = inp["c_inout"].clone()
 
+    # NOTE: read the current stream dynamically so the same closure works both for
+    # eager timing and for CUDA-graph capture (capture swaps in its own stream).
     def run_factored():
-        fac_launcher(h_fp16_out, c_fac,
+        fac_launcher(h_fp8_out, c_fac,
                      inp["hh_fp8"], inp["scale_hh"],
                      inp["dn_shuf"], inp["scale_dn"],
                      inp["up_shuf_f16"],
-                     inp["up_bias"], inp["ih_t_f16"], stream, B)
-        quant_launcher(h_fp8_out, h_scale_out, h_fp16_out, B, stream)
+                     inp["up_bias"], inp["ih_t_f16"], torch.cuda.current_stream(), B)
 
     def run_unfactored():
-        # Single fused launch — fp8 output, no separate quantize kernel.
         unf_launcher(h_fp8_out, c_unf,
                      inp["hh_fp8"], inp["scale_hh"],
                      inp["wf_shuf"], inp["scale_wf"],
-                     inp["up_bias"], inp["ih_t_interleaved"], stream, B)
+                     inp["up_bias"], inp["ih_t_interleaved"], torch.cuda.current_stream(), B)
 
     def time_fn(fn, nw, ni):
+        # Eager wall-time per step. NOTE: dominated by FlyDSL's CPU launch overhead
+        # (~12-20 µs/call) and noisy (±several µs) — this is NOT the kernel's GPU time.
         for _ in range(nw): fn()
         torch.cuda.synchronize()
-        t0 = torch.cuda.Event(enable_timing=True)
-        t1 = torch.cuda.Event(enable_timing=True)
-        t0.record(stream)
-        for _ in range(ni): fn()
-        t1.record(stream)
+        best = float("inf")
+        for _ in range(5):
+            t0 = torch.cuda.Event(enable_timing=True)
+            t1 = torch.cuda.Event(enable_timing=True)
+            t0.record(stream)
+            for _ in range(ni): fn()
+            t1.record(stream)
+            torch.cuda.synchronize()
+            best = min(best, t0.elapsed_time(t1) * 1e3 / ni)
+        return best
+
+    def time_fn_graph(fn, capture=50, rounds=10):
+        # True kernel GPU time: capture `capture` launches in a CUDA graph and replay.
+        # Removes CPU launch overhead so TFLOPS/BW reflect the kernel, not dispatch.
+        s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(5): fn()
+        torch.cuda.current_stream().wait_stream(s)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            for _ in range(capture): fn()
         torch.cuda.synchronize()
-        return t0.elapsed_time(t1) * 1e3 / ni
+        best = float("inf")
+        for _ in range(rounds):
+            t0 = torch.cuda.Event(enable_timing=True)
+            t1 = torch.cuda.Event(enable_timing=True)
+            t0.record()
+            for _ in range(20): g.replay()
+            t1.record(); torch.cuda.synchronize()
+            best = min(best, t0.elapsed_time(t1) * 1e3 / (20 * capture))
+        return best
 
     total_flops_fac = 2 * B * H * R + 2 * B * R * FH          # factored
     total_flops_unf = 2 * B * H * FH                            # unfactored
 
-    fac_bytes = (H*R + R*FH)*1 + (B*H + B*FH*2 + B*H*8 + B*H*2)
-    unf_bytes = (H*FH)*1       + (B*H + B*FH*2 + B*H*8 + B*H*2)
+    # weights(1B) + hh(1B) + ih_t(2B f16) + c read&write(8B f32) + h out(1B fp8)
+    fac_bytes = (H*R + R*FH)*1 + (B*H + B*FH*2 + B*H*8 + B*H*1)
+    unf_bytes = (H*FH)*1       + (B*H + B*FH*2 + B*H*8 + B*H*1)
 
-    us_fac = time_fn(run_factored,  warmup, iters)
-    us_unf = time_fn(run_unfactored, warmup, iters)
+    us_fac       = time_fn(run_factored,  warmup, iters)
+    us_unf       = time_fn(run_unfactored, warmup, iters)
+    us_fac_graph = time_fn_graph(run_factored)
+    us_unf_graph = time_fn_graph(run_unfactored)
 
-    def print_stats(label, us, flops, nbytes):
-        s = us * 1e-6
+    def print_stats(label, us_graph, us_eager, flops, nbytes):
+        # TFLOPS/BW computed from the GRAPH time (true kernel GPU throughput).
+        s = us_graph * 1e-6
         print(f"\n  [{label}]")
-        print(f"    Time/step : {us:.2f} µs  (T=1024: {us*1024/1e3:.1f} ms)")
-        print(f"    TFLOPS    : {flops/s/1e12:.3f}  ({flops/s/1e12/PEAK_FP8_TOPS*100:.1f}%)")
-        print(f"    BW GB/s   : {nbytes/s/1e9:.1f}  ({nbytes/s/1e9/PEAK_BW_GBS*100:.1f}%)")
+        print(f"    Time/step : {us_graph:.2f} µs graph  |  {us_eager:.2f} µs eager (launch-bound)")
+        print(f"               (T=1024 graph: {us_graph*1024/1e3:.1f} ms)")
+        print(f"    TFLOPS    : {flops/s/1e12:.1f}  ({flops/s/1e12/PEAK_FP8_TOPS*100:.1f}% of peak)")
+        print(f"    BW GB/s   : {nbytes/s/1e9:.1f}  ({nbytes/s/1e9/PEAK_BW_GBS*100:.1f}% of peak)")
+        print(f"    Arith. int: {flops/nbytes:.1f} FLOP/byte")
         wt_kb = (H*R + R*FH) if label.startswith("factored") else H*FH
         print(f"    Weight KB : {wt_kb/1e3:.0f}")
 
-    print_stats("factored  (Phase1+Phase2 fused)", us_fac, total_flops_fac, fac_bytes)
-    print_stats("unfactored (single GEMM fused)",  us_unf, total_flops_unf, unf_bytes)
-    print(f"\n  Factored speedup over unfactored: {us_unf/us_fac:.2f}×")
+    print_stats("factored  (Phase1+Phase2 fused)", us_fac_graph, us_fac, total_flops_fac, fac_bytes)
+    print_stats("unfactored (single GEMM fused)",  us_unf_graph, us_unf, total_flops_unf, unf_bytes)
+    print(f"\n  Unfactored speedup over factored (graph): {us_fac_graph/us_unf_graph:.2f}×")
 
 
 def main():

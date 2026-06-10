@@ -104,12 +104,12 @@ def make_inputs(device, seed=42):
 # ── Benchmark helper ──────────────────────────────────────────────────────────
 
 def time_launcher(launcher, inp, device, stream):
-    h_fp16_out = torch.zeros(B, H, dtype=torch.float16, device=device)
-    c_inout    = inp["c_base"].clone()
+    h_fp8_out = torch.zeros(B, H, dtype=torch.uint8, device=device)
+    c_inout   = inp["c_base"].clone()
 
     def run():
         launcher(
-            h_fp16_out, c_inout,
+            h_fp8_out, c_inout,
             inp["hh_fp8"], inp["scale_hh"],
             inp["dn_shuf"], inp["scale_dn"],
             inp["up_shuf_f16"],
