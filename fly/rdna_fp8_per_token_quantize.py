@@ -5,13 +5,15 @@ Quantizes a row-major fp16 tensor to fp8_e4m3fn with per-token (per-row) f32 sca
   inp[M, K]  fp16  →  out_fp8[M, K]  fp8_e4m3fn bytes
                        scale_a[M]    f32  (amax / 448.0)
 
-scale_a format matches the scale_a input of rdna_fp8_preshuffle_gemm, so the
-output can be fed directly to the FP8 fc2 GEMM as activation input.
+One block per row, BLOCK_THREADS threads per block.
+Each thread loads VEC_PER_THREAD fp16 elements as a 128-bit vector.
+Intra-warp max via XOR reduction; inter-warp max via LDS (NUM_WARPS slots).
+All threads read all warp-max slots and compute inv_scale independently.
 
-Grid:  (M, 1, 1) — one workgroup per row
-Block: (256, 1, 1)
+Grid:  (M, 1, 1)
+Block: (BLOCK_THREADS=128, 1, 1) = 4 warps × 32 lanes
 
-K must be a multiple of 256 and K // 256 must be a multiple of 4.
+K must be a multiple of BLOCK_THREADS (= 128).
 """
 
 import functools
@@ -19,142 +21,147 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl, vector
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import vector as mlir_vector
+from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fx_math
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
-from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
-BLOCK_THREADS = 256
-WARP_SIZE = 32
-NUM_WARPS = BLOCK_THREADS // WARP_SIZE  # 8
-FP8_MAX = 448.0
+WARP_SIZE      = 32
+BLOCK_THREADS  = 128              # 4 warps per block
+NUM_WARPS      = BLOCK_THREADS // WARP_SIZE   # 4
+FP8_MAX        = 448.0
+
+SHUFFLE_DISTS = [1 << i for i in range(int(math.log2(WARP_SIZE)))]  # [1,2,4,8,16]
 
 
 @functools.lru_cache(maxsize=32)
 def compile_fp8_per_token_quantize(*, K: int):
     """Compile FP16 → FP8 per-token quantize kernel for RDNA4.
 
-    K = inter_dim (number of elements per row, = N of the dual-GEMM output).
-    Must satisfy: K % 256 == 0 and (K // 256) % 4 == 0.
+    K = number of fp16 elements per row.  Must satisfy K % BLOCK_THREADS == 0.
 
     Returns launcher(out_fp8, scale_a, inp_fp16, m, stream).
     """
-    assert K % BLOCK_THREADS == 0, f"K={K} must be divisible by BLOCK_THREADS={BLOCK_THREADS}"
-    VEC = K // BLOCK_THREADS
-    assert VEC % 4 == 0, f"VEC={VEC} must be divisible by 4 for fp8 packing"
+    assert K % BLOCK_THREADS == 0, (
+        f"K={K} must be divisible by BLOCK_THREADS={BLOCK_THREADS}"
+    )
+    VEC_PER_THREAD = K // BLOCK_THREADS   # fp16 elements per thread (e.g. 8 for K=1024)
+    assert VEC_PER_THREAD % 8 == 0 or VEC_PER_THREAD == 8, (
+        f"VEC_PER_THREAD={VEC_PER_THREAD} must be 8 or a multiple of 8"
+    )
+    LOADS_PER_THREAD = max(1, VEC_PER_THREAD // 8)   # 128-bit buffer_loads per thread
 
-    arch = get_rocm_arch()
-
-    # LDS: NUM_WARPS f32 slots for inter-warp max reduction (reuse slot 0 for inv_scale broadcast)
-    allocator = SmemAllocator(None, arch=arch)
-    wmax_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = wmax_offset + NUM_WARPS * 4  # 8 * 4 = 32 bytes
-
-    SHUFFLE_DISTS = [1 << i for i in range(int(math.log2(WARP_SIZE)))]  # [1,2,4,8,16]
+    # LDS: NUM_WARPS f32 slots for inter-warp max + inv_scale broadcast (slot 0)
+    lds_alloc    = SmemAllocator(None, global_sym_name="smem_per_token_quant")
+    wmax_off     = lds_alloc._align(lds_alloc.ptr, 16)
+    lds_alloc.ptr = wmax_off + NUM_WARPS * 4
 
     @flyc.kernel
     def kernel_fp8_per_token_quantize(
-        arg_out_fp8: fx.Tensor,
+        arg_out_fp8:   fx.Tensor,
         arg_out_scale: fx.Tensor,
-        arg_inp: fx.Tensor,
+        arg_inp:       fx.Tensor,
     ):
-        bid = fx.block_idx.x
-        tid = fx.thread_idx.x
-
+        bid     = fx.block_idx.x
+        tid     = fx.thread_idx.x
         lane    = tid % WARP_SIZE
         warp_id = tid // WARP_SIZE
-        thread_id = ArithValue(tid)
 
-        # Layout API for fp16 input
-        inp_buf      = fx.rocdl.make_buffer_tensor(arg_inp)
-        copy_atom    = fx.make_copy_atom(fx.rocdl.BufferCopy(VEC * 16), 16)  # 16 bits = fp16
-        vec_f32_ty   = T.vec(VEC, T.f32)
-        vec_reg_ty   = fx.MemRefType.get(T.f16, fx.LayoutType.get(VEC, 1), fx.AddressSpace.Register)
-        vec_reg_lay  = fx.make_layout(VEC, 1)
+        tid_i32     = ArithValue(arith.index_cast(T.i32, tid))
+        bid_i32     = ArithValue(arith.index_cast(T.i32, bid))
+        warp_id_i32 = ArithValue(arith.index_cast(T.i32, warp_id))
 
-        def _load_vec(div_tensor, idx):
-            r = fx.memref_alloca(vec_reg_ty, vec_reg_lay)
-            fx.copy_atom_call(copy_atom, fx.slice(div_tensor, (None, idx)), r)
-            return fx.memref_load_vec(r)
-
+        inp_rsrc   = buffer_ops.create_buffer_resource(arg_inp,       max_size=True)
         out_rsrc   = buffer_ops.create_buffer_resource(arg_out_fp8,   max_size=True)
         scale_rsrc = buffer_ops.create_buffer_resource(arg_out_scale, max_size=True)
 
-        # LDS for inter-warp max reduction
-        base_ptr = allocator.get_base()
-        s_wmax = SmemPtr(base_ptr, wmax_offset, T.f32, shape=(NUM_WARPS,))
-        s_wmax.get()
+        # LDS: NUM_WARPS f32 slots for per-warp max
+        base_ptr = lds_alloc.get_base()
+        s_wmax   = SmemPtr(base_ptr, wmax_off, T.f32, shape=(NUM_WARPS,))
+        # Force memref materialization at the top level so it dominates all uses,
+        # including those inside conditional blocks (if lane == 0, etc.).
+        _        = s_wmax.get()
 
-        # Load VEC fp16 values and extend to f32
-        row_x   = fx.slice(inp_buf, (bid, None))
-        row_div = fx.logical_divide(row_x, fx.make_layout(VEC, 1))
-        inp_f32 = _load_vec(row_div, thread_id).extf(vec_f32_ty)
+        # Thread-contiguous f16 base: bid * K + tid * VEC_PER_THREAD
+        f16_base = bid_i32 * K + tid_i32 * VEC_PER_THREAD
 
-        # Extract individual f32 values
-        c0_f32 = arith.constant(0.0, type=T.f32)
-        vals = []
-        for vi in range_constexpr(VEC):
-            v = ArithValue(vector.extract(inp_f32, static_position=[vi], dynamic_position=[]))
-            vals.append(v)
-
-        # Thread-local max
+        # ── Pass 1: load all data, compute local amax in f32 ─────────────────
+        c0_f32    = arith.constant(0.0, type=T.f32)
         local_max = c0_f32
-        for vi in range_constexpr(VEC):
-            local_max = local_max.maximumf(fx_math.absf(vals[vi]))
+        all_vals  = []   # VEC_PER_THREAD f32 ArithValues
 
-        # Warp-level max via shuffle_xor
+        for li in range_constexpr(LOADS_PER_THREAD):
+            # 128-bit buffer_load (8 fp16 = 128 bits); offset in f16 element units
+            vec_f16 = buffer_ops.buffer_load(
+                inp_rsrc, f16_base + li * 8, vec_width=8, dtype=fx.Float16)
+            # Extend vec<8xf16> → vec<8xf32> then extract scalars
+            vec_f32_ty = T.vec(8, T.f32)
+            vec_f32    = ArithValue(vec_f16).extf(vec_f32_ty)
+            for vi in range_constexpr(8):
+                v = ArithValue(mlir_vector.extract(
+                    vec_f32, static_position=[vi], dynamic_position=[]))
+                all_vals.append(v)
+                local_max = local_max.maximumf(fx_math.absf(v))
+
+        # ── Warp XOR reduction → warp-level max ──────────────────────────────
         for sh_dist in SHUFFLE_DISTS:
-            local_max = local_max.maximumf(local_max.shuffle_xor(sh_dist, WARP_SIZE))
+            local_max = local_max.maximumf(
+                local_max.shuffle_xor(sh_dist, WARP_SIZE))
 
-        # Store warp max to LDS (lane 0 only), then inter-warp reduction
+        # Lane 0 of each warp writes warp max to LDS slot [warp_id]
         if lane == 0:
-            SmemPtr.store(s_wmax, local_max, [warp_id])
+            SmemPtr.store(s_wmax, local_max, [warp_id_i32])
         gpu.barrier()
 
-        if warp_id == 0:
-            in_range = lane < NUM_WARPS
-            lane_safe = in_range.select(lane, 0)
-            v = SmemPtr.load(s_wmax, [lane_safe])
-            v = in_range.select(v, c0_f32)
-            for sh_dist in SHUFFLE_DISTS:
-                v = v.maximumf(v.shuffle_xor(sh_dist, WARP_SIZE))
-            if lane == 0:
-                eps      = arith.constant(1e-12, type=T.f32)
-                fp8_max  = arith.constant(FP8_MAX, type=T.f32)
-                gmax     = v.maximumf(eps)
-                scale    = gmax / fp8_max
-                bid_i32  = ArithValue(fx.arith.index_cast(T.i32, bid))
-                buffer_ops.buffer_store(scale, scale_rsrc, bid_i32)
-                inv_sc   = fp8_max / gmax
-                SmemPtr.store(s_wmax, inv_sc, [0])
-        gpu.barrier()
+        # ── Inter-warp reduce: all threads read all NUM_WARPS warp-max slots ──
+        # Using constexpr integer indices avoids any conditional-scoped MLIR values.
+        gmax = c0_f32
+        for wi in range_constexpr(NUM_WARPS):
+            wv   = SmemPtr.load(s_wmax, [wi])
+            gmax = gmax.maximumf(wv)
 
-        inv_scale = SmemPtr.load(s_wmax, [0])
+        eps      = arith.constant(1e-12, type=T.f32)
+        fp8_max  = arith.constant(FP8_MAX, type=T.f32)
+        gmax     = gmax.maximumf(eps)
+        inv_sc   = ArithValue(fp8_max) / gmax
+        scale    = gmax / ArithValue(fp8_max)
 
-        # Quantize and pack fp8 output
-        bid_i32    = ArithValue(fx.arith.index_cast(T.i32, bid))
-        col0       = thread_id * VEC
-        fp8_byte_off = bid_i32 * K + col0
+        # All lane-0 threads write the same scale value — safe, no race.
+        if lane == 0:
+            buffer_ops.buffer_store(scale, scale_rsrc, bid_i32)
 
-        for wg in range_constexpr(VEC // 4):
+        # ── Pass 2: scale f32 values → pack fp8, store ───────────────────────
+        fp8_base = bid_i32 * K + tid_i32 * VEC_PER_THREAD
+        zero     = arith.constant(0, type=T.i32)
+
+        for wg in range_constexpr(VEC_PER_THREAD // 4):
             base = wg * 4
-            scaled = [vals[base + e] * inv_scale for e in range_constexpr(4)]
-            packed = arith.constant(0, type=T.i32)
-            packed = rocdl.cvt_pk_fp8_f32(T.i32, scaled[0], scaled[1], packed, 0)
-            packed = rocdl.cvt_pk_fp8_f32(T.i32, scaled[2], scaled[3], packed, 1)
-            word_off = fp8_byte_off + wg * 4
+            v0 = all_vals[base + 0] * inv_sc
+            v1 = all_vals[base + 1] * inv_sc
+            v2 = all_vals[base + 2] * inv_sc
+            v3 = all_vals[base + 3] * inv_sc
+            packed = rocdl.cvt_pk_fp8_f32(T.i32, v0, v1, zero, 0)
+            packed = rocdl.cvt_pk_fp8_f32(T.i32, v2, v3, packed, 1)
+            word_off = fp8_base + wg * 4
             buffer_ops.buffer_store(packed, out_rsrc, word_off, offset_is_bytes=True)
 
     @flyc.jit
     def launch_fp8_per_token_quantize(
-        arg_out_fp8: fx.Tensor,
+        arg_out_fp8:   fx.Tensor,
         arg_out_scale: fx.Tensor,
-        arg_inp: fx.Tensor,
-        m: fx.Int32,
-        stream: fx.Stream,
+        arg_inp:       fx.Tensor,
+        m:             fx.Int32,
+        stream:        fx.Stream,
     ):
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            lds_alloc.finalized = False
+            lds_alloc.finalize()
+
         c1 = 1
         launcher = kernel_fp8_per_token_quantize(arg_out_fp8, arg_out_scale, arg_inp)
         launcher.launch(
