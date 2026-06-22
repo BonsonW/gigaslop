@@ -1,0 +1,19 @@
+# Down-projection export configs (x_down = x @ dn, fused-LSTM precompute).
+# M is only used for the dummy compile tensors; the launched kernel takes M
+# at runtime (grid = ceil(M/tile_m), tail rows masked).
+
+# Per-step hh_down (M = N = batch, small): n_split=4 raises occupancy → ~6.5µs vs 9µs.
+[[configs]]
+M = 256    # compile-time dummy M (runtime M is dynamic)
+C = 1024
+R = 128
+n_split = 4
+
+# Pre-loop x_down precompute (M = T*N, large): n_split=1 — the GEMM is already
+# bandwidth-bound at large M, so n_split>1 only adds redundant x-reads (up to 66% slower).
+[[configs]]
+M = 256
+C = 1024
+R = 128
+n_split = 1
+tag = "precompute"

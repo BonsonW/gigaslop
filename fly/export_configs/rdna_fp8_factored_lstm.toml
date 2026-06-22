@@ -1,0 +1,11 @@
+# Factored LSTM export configs (HAC v6 factored model).
+# BOTH projections kept low-rank: gates = hh_down@up_hh + x_down@up_ih + biases.
+# No K=H GEMM. hh_down (= h@dn_hh) is produced per-step by the down-proj kernel.
+# M (batch) is only used for the dummy compile tensors; the launched kernel takes
+# B at runtime (grid = (B/tile_m) * grid_h).
+
+[[configs]]
+M = 256   # compile-time dummy batch (runtime B is dynamic)
+H = 1024
+K_hh = 128
+R = 128

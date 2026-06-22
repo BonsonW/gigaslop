@@ -221,7 +221,7 @@ def benchmark(B, device, warmup=20, iters=500):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-verify", action="store_true")
-    parser.add_argument("--batch", type=int, default=512)
+    parser.add_argument("--batch", type=int, default=256)
     parser.add_argument("--iters", type=int, default=500)
     args = parser.parse_args()
 

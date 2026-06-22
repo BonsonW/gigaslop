@@ -1,0 +1,21 @@
+# Export configurations for rdna_fp8_factored_gemm (fused low-rank input projection)
+# Run: python fly/export_fp8_factored_gemm.py --config fly/export_configs/rdna_fp8_factored_gemm.toml
+#
+# Each [[configs]] entry compiles a separate HSACO + C header pair.
+# Computes ih[M,N] = (x[M,C] @ dn[C,R]) @ up[R,N] + bias, fused through LDS.
+#   C = input feature dim, R = rank/intermediate, N = output dim.
+# M (token count) is runtime via grid_m; M here only sets the compile assertion
+# (M % tile_m == 0). If omitted, uses --M (default 512).
+#
+# Outputs: artifacts/rdna_fp8_factored_gemm_C{C}_R{R}_N{N}.hsaco + .h
+
+# LSTM input projection: x[M,1024] -> x_down[M,128] -> ih[M,4096]
+# n_split: split the N output across this many blocks per M-tile to raise occupancy
+# at small M (per-timestep use). Rule of thumb: n_split ~= 128 / ceil(M/32).
+#   M=256 (per-timestep) -> n_split=16 ;  M=512 -> n_split=8 ;  large batched M -> 1
+[[configs]]
+M = 256
+C = 1024
+R = 128
+N = 4096
+n_split = 16

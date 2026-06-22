@@ -1,0 +1,6 @@
+# f16 down-projection (layer-0 precompute, no quantize). Large M = T*N → n_split=1.
+[[configs]]
+M = 256    # compile-time dummy M (runtime M is dynamic)
+C = 1024
+R = 128
+n_split = 1

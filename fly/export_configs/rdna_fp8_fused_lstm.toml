@@ -1,0 +1,9 @@
+# Fused LSTM export configs (HAC v6 factored model).
+# Folds the input up-projection into the LSTM gates — no ih[B,4H] tensor.
+# M (batch) is only used for the dummy compile tensors; the launched kernel
+# takes B at runtime (grid = (B/tile_m) * grid_h).
+
+[[configs]]
+M = 256   # compile-time dummy batch (runtime B is dynamic)
+H = 1024
+R = 128
