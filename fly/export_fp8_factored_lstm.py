@@ -30,7 +30,7 @@ os.environ.setdefault("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from rdna_fp8_unfactored_lstm_gemm import compile_fp8_factored_lstm
+from rdna_fp8_factored_lstm import compile_fp8_factored_lstm
 
 TILE_M = 32
 TILE_N_H = 32

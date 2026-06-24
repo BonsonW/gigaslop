@@ -5,16 +5,16 @@ Per step the real pipeline runs TWO kernels:
   1. hh_down = h_prev_fp8 @ dn_hh   (compile_fp8_down_proj, recurrent)
   2. gates  = hh_down@up_hh + x_down@up_ih + bias_hh + bias_ih -> LSTM  (compile_fp8_factored_lstm)
 
-This bench checks correctness vs a torch reference, equivalence vs the current fused
-kernel, and times (down_proj + factored_lstm) vs fused_lstm under CUDA graph.
+This bench checks correctness vs a torch reference and times the per-step pipeline
+(down_proj + factored_lstm) under CUDA graph.
 """
 import argparse, os, sys
 os.environ.setdefault("FLYDSL_RUNTIME_ENABLE_CACHE", "1")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
-from rdna_fp8_unfactored_lstm_gemm import (
-    compile_fp8_factored_lstm, compile_fp8_fused_lstm,
+from rdna_fp8_factored_lstm import (
+    compile_fp8_factored_lstm,
     preshuffle_b_fp8, preshuffle_b_f16,
     fp8_quantize_per_token, fp8_quantize_per_channel,
 )
@@ -149,19 +149,6 @@ def benchmark(B, device):
     print(f"  factored_lstm       : {us_lstm:6.2f} us/step")
     print(f"  TOTAL  (dp + lstm)  : {us_both:6.2f} us/step")
     print(f"    TFLOPS  : {flops/s/1e12:.1f}  ({flops/s/1e12/PEAK_FP8_TOPS*100:.1f}% of fp8 peak)")
-
-    # head-to-head vs current fused kernel
-    fused = compile_fp8_fused_lstm(B=B, H=H, R=R)
-    hh = torch.zeros(B, H, dtype=torch.uint8, device=device)
-    shh = torch.ones(B, dtype=torch.float32, device=device) * OUT_SCALE
-    Wf  = torch.randn(FH, H, device=device) * 0.02
-    Wf_fp8, swf = fp8_quantize_per_channel(Wf.t().contiguous()); wf = preshuffle_b_fp8(Wf_fp8)
-    c_w2 = inp["c"].clone()
-    def fn_fused():
-        fused(hh, c_w2, hh, shh, wf, swf, inp["bhh"], inp["x_down"], inp["up_ih_shuf"], inp["bih"],
-              torch.cuda.current_stream(), B)
-    us_fused = _graph_time(fn_fused)
-    print(f"  --- current fused_lstm: {us_fused:6.2f} us/step  ->  factored speedup {us_fused/us_both:.2f}x")
 
 
 def main():
