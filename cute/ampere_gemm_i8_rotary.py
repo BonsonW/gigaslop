@@ -26,6 +26,8 @@ memory. bN is pinned to head_dim so each N-tile is exactly one head and the
 companion column is always within the tile.
 """
 
+from typing import Tuple, Type
+
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
@@ -394,6 +396,73 @@ class TensorOpGemmI8Rotary(TensorOpGemmI8):
 
 
 # =============================================================================
+# AOT export
+# =============================================================================
+def export_gemm_i8_rotary(
+    nhead: int,
+    head_dim: int,
+    rotary_dim: int,
+    seqlen: int,
+    a_dtype: Type[cutlass.Numeric] = cutlass.Int8,
+    b_dtype: Type[cutlass.Numeric] = cutlass.Int8,
+    c_dtype: Type[cutlass.Numeric] = cutlass.Float16,
+    acc_dtype: Type[cutlass.Numeric] = cutlass.Int32,
+    atom_layout_mnk: Tuple[int, int, int] = (2, 2, 1),
+    file_path: str = "./artifacts",
+    file_name: str = "gemm_i8_rotary",
+    function_prefix: str = "gemm_i8_rotary",
+    use_k32: bool = True,
+    bm: int = 128,
+    bn: int = 128,
+    num_stages: int = 3,
+    m_size: int = 128,
+    k_size: int = 128,
+    l_size: int = 1,
+) -> None:
+    """AOT-compile the fused INT8 GEMM + rotary kernel and emit a C header.
+
+    Computes C[M,N] = rotary(A@B^T) for QKV, fp16 output. N = 3*nhead*head_dim.
+    nhead/head_dim/rotary_dim/seqlen and the tile/atom config are baked at export
+    (seqlen is compile-time here, unlike the FlyDSL kernel's runtime seqlen);
+    M is dynamic at runtime. bn must be a multiple of head_dim.
+
+    Emits <file_path>/<file_name>.h with tensor structs for all 7 arguments in
+    __call__ order: mA, mB, mC, mScaleA, mScaleB, mSin, mCos.
+    """
+    n_size = 3 * nhead * head_dim
+    rotary_half = rotary_dim // 2
+
+    fake_a, _ = create_and_permute_tensor(l_size, m_size, k_size, False, a_dtype)
+    fake_b, _ = create_and_permute_tensor(l_size, n_size, k_size, False, b_dtype)
+    fake_c, _ = create_and_permute_tensor(l_size, m_size, n_size, False, c_dtype)
+    fake_scale_a = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (m_size, l_size), assumed_align=16)
+    fake_scale_b = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (n_size, l_size), assumed_align=16)
+    fake_sin = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (seqlen, rotary_half), assumed_align=16)
+    fake_cos = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (seqlen, rotary_half), assumed_align=16)
+
+    gemm = TensorOpGemmI8Rotary(
+        a_dtype, b_dtype, c_dtype, acc_dtype,
+        atom_layout_mnk, use_k32, bm, bn=bn, num_stages=num_stages,
+        nhead=nhead, head_dim=head_dim, rotary_dim=rotary_dim, seqlen=seqlen,
+    )
+    print(f"Compiling TensorOpGemmI8Rotary  N={n_size} K={k_size}  tile={bm}x{bn}x64  "
+          f"atom={atom_layout_mnk}  nhead={nhead} head_dim={head_dim} "
+          f"rotary_dim={rotary_dim} seqlen={seqlen}")
+    compiled = cute.compile(
+        gemm, fake_a, fake_b, fake_c, fake_scale_a, fake_scale_b, fake_sin, fake_cos,
+    )
+    print(f"Exporting to {file_path}/{file_name}.h ...")
+    compiled.export_to_c(
+        file_path=file_path, file_name=file_name, function_prefix=function_prefix,
+    )
+    print("Export complete!")
+
+
+# =============================================================================
 # Host-side reference
 # =============================================================================
 def rotary_ref(A_int8, B_int8, scale_a, scale_b, sin_buf, cos_buf,
@@ -418,4 +487,7 @@ def rotary_ref(A_int8, B_int8, scale_a, scale_b, sin_buf, cos_buf,
     return out
 
 
-__all__ = ["TensorOpGemmI8Rotary", "rotary_ref", "create_and_permute_tensor"]
+__all__ = [
+    "TensorOpGemmI8Rotary", "export_gemm_i8_rotary",
+    "rotary_ref", "create_and_permute_tensor",
+]

@@ -1,0 +1,21 @@
+# Export configurations for the fused INT8 GEMM + rotary kernel
+# (cute/ampere_gemm_i8_rotary.py).
+#
+# Run:
+#   pyvenv/bin/python cute/export_gemm_i8_rotary.py \
+#       --config cute/export_configs/gemm_i8_rotary.toml
+#
+# Each [[configs]] entry emits one C header pair via export_to_c:
+#   artifacts/gemm_i8_rotary_N{N}_K{K}_H{nhead}D{head_dim}R{rotary_dim}S{seqlen}.h
+#
+# N must equal 3 * nhead * head_dim (QKV concatenated).
+# K = input dim.  seqlen is baked at export (compile-time in this kernel).
+# M is only used to size the symbolic trace; the kernel handles M dynamically.
+
+[[configs]]
+M = 256
+K = 512
+nhead = 8
+head_dim = 64
+rotary_dim = 64
+seqlen = 1024

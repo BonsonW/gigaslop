@@ -1,0 +1,18 @@
+# Export configurations for the dual INT8 GEMM + SiLU kernel
+# (cute/ampere_dual_gemm_i8_silu.py).
+#
+# Run:
+#   pyvenv/bin/python cute/export_dual_gemm_i8_silu.py \
+#       --config cute/export_configs/dual_gemm_i8_silu.toml
+#
+# Each [[configs]] entry emits one C header pair via export_to_c:
+#   artifacts/gemm_i8_dual_silu_N{N}_K{K}.h
+#
+# N = inter_dim (each of the gate and up projection widths)
+# K = model_dim (fc1 input width)
+# M is only used to size the symbolic trace; the kernel handles M dynamically.
+
+[[configs]]
+M = 256
+N = 2048
+K = 512

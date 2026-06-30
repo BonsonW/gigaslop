@@ -433,6 +433,65 @@ class TensorOpDualGemmI8Silu(TensorOpGemmI8):
 
 
 # =============================================================================
+# AOT export
+# =============================================================================
+def export_dual_gemm_i8_silu(
+    a_dtype: Type[cutlass.Numeric] = cutlass.Int8,
+    b_dtype: Type[cutlass.Numeric] = cutlass.Int8,
+    c_dtype: Type[cutlass.Numeric] = cutlass.Float16,
+    acc_dtype: Type[cutlass.Numeric] = cutlass.Int32,
+    atom_layout_mnk: Tuple[int, int, int] = (2, 2, 1),
+    file_path: str = "./artifacts",
+    file_name: str = "gemm_i8_dual_silu",
+    function_prefix: str = "gemm_i8_dual_silu",
+    use_k32: bool = True,
+    bm: int = 128,
+    bn: int = 64,
+    num_stages: int = 3,
+    m_size: int = 128,
+    n_size: int = 128,
+    k_size: int = 128,
+    l_size: int = 1,
+) -> None:
+    """AOT-compile the dual INT8 GEMM + SiLU kernel and emit a C header.
+
+    Computes out[M,N] = silu(A@B_gate^T) * (A@B_up^T), fp16 output.
+    Dimensions are dynamic at runtime; the tile/atom config is baked at export.
+    Mirrors export_tensor_op_gemm_i8 in ampere_gemm_i8_quant_rmem.py, but with two
+    B operands and two per-channel scales.
+
+    Emits <file_path>/<file_name>.h with a <function_prefix>_Kernel_Module_Load,
+    a cute_dsl_<function_prefix>_wrapper, and tensor structs for all 7 arguments
+    in __call__ order: mA, mB_gate, mB_up, mC, mScaleA, mScaleB_gate, mScaleB_up.
+    """
+    fake_a, _ = create_and_permute_tensor(l_size, m_size, k_size, False, a_dtype)
+    fake_b_gate, _ = create_and_permute_tensor(l_size, n_size, k_size, False, b_dtype)
+    fake_b_up, _ = create_and_permute_tensor(l_size, n_size, k_size, False, b_dtype)
+    fake_c, _ = create_and_permute_tensor(l_size, m_size, n_size, False, c_dtype)
+    fake_scale_a = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (m_size, l_size), assumed_align=16)
+    fake_scale_b_gate = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (n_size, l_size), assumed_align=16)
+    fake_scale_b_up = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (n_size, l_size), assumed_align=16)
+
+    gemm = TensorOpDualGemmI8Silu(
+        a_dtype, b_dtype, c_dtype, acc_dtype,
+        atom_layout_mnk, use_k32, bm, bn=bn, num_stages=num_stages,
+    )
+    print(f"Compiling TensorOpDualGemmI8Silu  tile={bm}x{bn}x64  atom={atom_layout_mnk}  stages={num_stages}")
+    compiled = cute.compile(
+        gemm, fake_a, fake_b_gate, fake_b_up, fake_c,
+        fake_scale_a, fake_scale_b_gate, fake_scale_b_up,
+    )
+    print(f"Exporting to {file_path}/{file_name}.h ...")
+    compiled.export_to_c(
+        file_path=file_path, file_name=file_name, function_prefix=function_prefix,
+    )
+    print("Export complete!")
+
+
+# =============================================================================
 # Host-side reference / helpers
 # =============================================================================
 def dual_gemm_silu_ref(A_int8, B_gate_int8, B_up_int8, scale_a, scale_b_gate, scale_b_up):
@@ -445,4 +504,7 @@ def dual_gemm_silu_ref(A_int8, B_gate_int8, B_up_int8, scale_a, scale_b_gate, sc
     return (gate * torch.sigmoid(gate) * up)
 
 
-__all__ = ["TensorOpDualGemmI8Silu", "dual_gemm_silu_ref", "create_and_permute_tensor"]
+__all__ = [
+    "TensorOpDualGemmI8Silu", "export_dual_gemm_i8_silu",
+    "dual_gemm_silu_ref", "create_and_permute_tensor",
+]
