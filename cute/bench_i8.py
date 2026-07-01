@@ -115,44 +115,44 @@ compiled_gemm = cute.compile(tensor_op_gemm, mA, mB, mC)
 compiled_gemm(mA, mB, mC)
 
 # Benchmark
-# print("\n=== Benchmarking GEMM kernel ===")
-# def benchmark(callable, a_, b_, c_):
-#     avg_time_us = cute.testing.benchmark(
-#         callable,
-#         kernel_arguments=cute.testing.JitArguments(a_, b_, c_),
-#         warmup_iterations=5,
-#         iterations=100,
-#     )
+print("\n=== Benchmarking GEMM kernel ===")
+def benchmark(callable, a_, b_, c_):
+    avg_time_us = cute.testing.benchmark(
+        callable,
+        kernel_arguments=cute.testing.JitArguments(a_, b_, c_),
+        warmup_iterations=5,
+        iterations=100,
+    )
 
-#     # Bytes transferred: A (read) + B (read) + C (write)
-#     # Use actual unpadded shapes for meaningful bandwidth numbers
-#     a_bytes = M * K * (cutlass.Int8.width // 8)
-#     b_bytes = N * K * (cutlass.Int8.width // 8)
-#     c_bytes = M * N * (cutlass.Int32.width // 8)
-#     total_bytes = a_bytes + b_bytes + c_bytes
+    # Bytes transferred: A (read) + B (read) + C (write)
+    # Use actual unpadded shapes for meaningful bandwidth numbers
+    a_bytes = M * K * (cutlass.Int8.width // 8)
+    b_bytes = N * K * (cutlass.Int8.width // 8)
+    c_bytes = M * N * (cutlass.Int32.width // 8)
+    total_bytes = a_bytes + b_bytes + c_bytes
 
-#     # Compute ops: each output element is a dot product of length K
-#     # INT8 GEMM: 2 ops per MAC (multiply + accumulate), M*N*K MACs total
-#     total_ops = 2 * M * N * K
+    # Compute ops: each output element is a dot product of length K
+    # INT8 GEMM: 2 ops per MAC (multiply + accumulate), M*N*K MACs total
+    total_ops = 2 * M * N * K
 
-#     # Metrics
-#     avg_time_s = avg_time_us * 1e-6
-#     achieved_bandwidth_gbs = (total_bytes / avg_time_s) / 1e9
-#     tops = (total_ops / avg_time_s) / 1e12
+    # Metrics
+    avg_time_s = avg_time_us * 1e-6
+    achieved_bandwidth_gbs = (total_bytes / avg_time_s) / 1e9
+    tops = (total_ops / avg_time_s) / 1e12
 
-#     # Theoretical peaks for A100 (adjust for your GPU)
-#     # A100 INT8 tensor core peak: 624 TOPS
-#     # A100 memory bandwidth: 2 TB/s
-#     peak_tops = 624.0
-#     peak_bw_gbs = 2000.0
-#     tops_efficiency = (tops / peak_tops) * 100
-#     bw_efficiency = (achieved_bandwidth_gbs / peak_bw_gbs) * 100
+    # Theoretical peaks for A100 (adjust for your GPU)
+    # A100 INT8 tensor core peak: 624 TOPS
+    # A100 memory bandwidth: 2 TB/s
+    peak_tops = 624.0
+    peak_bw_gbs = 2000.0
+    tops_efficiency = (tops / peak_tops) * 100
+    bw_efficiency = (achieved_bandwidth_gbs / peak_bw_gbs) * 100
 
-#     print(f"Performance Metrics:")
-#     print(f"  Matrix shape:       M={M}, N={N}, K={K}")
-#     print(f"  Execution time:     {avg_time_us:.2f} us")
-#     print(f"  Compute:            {tops:.3f} TOPS  ({tops_efficiency:.1f}% of {peak_tops} TOPS peak)")
-#     print(f"  Bandwidth:          {achieved_bandwidth_gbs:.1f} GB/s  ({bw_efficiency:.1f}% of {peak_bw_gbs} GB/s peak)")
-#     print(f"  Arithmetic intensity: {total_ops / total_bytes:.1f} FLOP/byte")
+    print(f"Performance Metrics:")
+    print(f"  Matrix shape:       M={M}, N={N}, K={K}")
+    print(f"  Execution time:     {avg_time_us:.2f} us")
+    print(f"  Compute:            {tops:.3f} TOPS  ({tops_efficiency:.1f}% of {peak_tops} TOPS peak)")
+    print(f"  Bandwidth:          {achieved_bandwidth_gbs:.1f} GB/s  ({bw_efficiency:.1f}% of {peak_bw_gbs} GB/s peak)")
+    print(f"  Arithmetic intensity: {total_ops / total_bytes:.1f} FLOP/byte")
 
-# benchmark(compiled_gemm, mA, mB, mC)
+benchmark(compiled_gemm, mA, mB, mC)

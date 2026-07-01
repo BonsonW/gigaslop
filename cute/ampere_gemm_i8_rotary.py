@@ -439,10 +439,15 @@ def export_gemm_i8_rotary(
         cutlass.Float32, (m_size, l_size), assumed_align=16)
     fake_scale_b = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32, (n_size, l_size), assumed_align=16)
+    # sin/cos are row-major [seqlen, rotary_half] at runtime (contiguous, stride
+    # (rotary_half, 1)). make_fake_compact_tensor defaults to COLUMN-MAJOR
+    # (stride_order left-to-right -> stride (1, seqlen)), which would bake the
+    # wrong strides into mSin[seq, rot_idx] and read garbage/out-of-bounds over
+    # the AOT C ABI. Pin row-major with stride_order=(1, 0).
     fake_sin = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32, (seqlen, rotary_half), assumed_align=16)
+        cutlass.Float32, (seqlen, rotary_half), stride_order=(1, 0), assumed_align=16)
     fake_cos = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32, (seqlen, rotary_half), assumed_align=16)
+        cutlass.Float32, (seqlen, rotary_half), stride_order=(1, 0), assumed_align=16)
 
     gemm = TensorOpGemmI8Rotary(
         a_dtype, b_dtype, c_dtype, acc_dtype,
