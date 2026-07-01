@@ -70,7 +70,7 @@ if __name__ == "__main__":
     p.add_argument("--N", type=int, default=2048, help="Inter dim (gate/up width)")
     p.add_argument("--K", type=int, default=512, help="Model dim (fc1 input)")
     p.add_argument("--bm", type=int, default=128)
-    p.add_argument("--bn", type=int, default=64, help="N tile (small: dual accumulator pressure)")
+    p.add_argument("--bn", type=int, default=32, help="N tile (small: dual accumulator pressure; 32 wins at K=512, must be >= atom_N*16)")
     p.add_argument("--num-stages", type=int, default=3)
     p.add_argument("--atom-layout", type=str, default="2,2,1")
     p.add_argument("--out", type=str, default=None, help="Artifacts dir (default: cute/artifacts)")

@@ -47,10 +47,10 @@ cos_buf = torch.cos(theta + rot).contiguous()
 a_dtype = b_dtype = cutlass.Int8
 c_dtype = cutlass.Float16
 acc_dtype = cutlass.Int32
-atom_layout_mnk = (2, 2, 1)
+atom_layout_mnk = (2, 4, 1)   # 8 warps: bigger N-tile needs the extra warps to split N
 num_stages = 3
 use_k32 = True
-bm, bN, bK = 128, 128, 64   # bN = 2*head_dim (multiple of head_dim)
+bm, bN, bK = 128, 256, 64   # bN=256 (4 heads/tile): fastest at this shape (~+3% vs bN=128)
 
 M_pad = ((M + bm - 1) // bm) * bm
 N_pad = ((N + bN - 1) // bN) * bN
@@ -95,6 +95,12 @@ if verify_correctness:
         print(f"  Mean abs error: {err.mean().item():.6f}")
 
 print("=== Benchmarking ===")
+# A cold A100 ramps its SM clock over a few hundred ms; cute.testing.benchmark's
+# short warmup finishes before clocks boost, under-reporting TOPS by ~25%. Warm the
+# GPU with a sustained run first so the measured number reflects steady-state clocks.
+for _ in range(400):
+    compiled(mA, mB, mC, mScaleA, mScaleB, mSin, mCos)
+torch.cuda.synchronize()
 t = cute.testing.benchmark(
     compiled,
     kernel_arguments=cute.testing.JitArguments(mA, mB, mC, mScaleA, mScaleB, mSin, mCos),

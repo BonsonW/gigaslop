@@ -89,9 +89,9 @@ if __name__ == "__main__":
     p.add_argument("--rotary-dim", type=int, default=64)
     p.add_argument("--seqlen", type=int, default=1024)
     p.add_argument("--bm", type=int, default=128)
-    p.add_argument("--bn", type=int, default=128, help="N tile (must be a multiple of head_dim)")
+    p.add_argument("--bn", type=int, default=256, help="N tile (must be a multiple of head_dim)")
     p.add_argument("--num-stages", type=int, default=3)
-    p.add_argument("--atom-layout", type=str, default="2,2,1")
+    p.add_argument("--atom-layout", type=str, default="2,4,1")
     p.add_argument("--out", type=str, default=None, help="Artifacts dir (default: cute/artifacts)")
     args = p.parse_args()
 

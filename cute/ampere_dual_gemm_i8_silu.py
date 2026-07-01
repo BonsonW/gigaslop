@@ -39,7 +39,13 @@ class TensorOpDualGemmI8Silu(TensorOpGemmI8):
     Inherits __init__ and the helper methods (_make_smem_layout_AB,
     _make_gmem_tiled_copy_AB, raster_tile) from TensorOpGemmI8. Note the
     register-accumulator pressure is doubled (gate + up), so bN should be
-    smaller than the single-GEMM kernel (default config uses bN=64).
+    smaller than the single-GEMM kernel. For the deployed K=512 shape bN=32
+    (atom (2,2,1), 3 stages) is the more robust default: it ties bN=64 at large M
+    (~215 TOPS at M=131072) and is clearly faster at small M (halving the N tile
+    halves the doubled C accumulator, raising occupancy when there is little work
+    to hide latency). Run autotune_dual.py to tune a specific shape.
+    Constraint: bN >= atom_N * mmaN * 2 (=32 for atom_N=2, =64 for atom_N=4);
+    smaller bN with a wider atom hangs compilation.
     """
 
     @cute.jit
@@ -446,7 +452,7 @@ def export_dual_gemm_i8_silu(
     function_prefix: str = "gemm_i8_dual_silu",
     use_k32: bool = True,
     bm: int = 128,
-    bn: int = 64,
+    bn: int = 32,
     num_stages: int = 3,
     m_size: int = 128,
     n_size: int = 128,
