@@ -68,6 +68,7 @@ class TensorOpGemmI8Rotary(TensorOpGemmI8):
         mScaleB: cute.Tensor,
         mSin: cute.Tensor,
         mCos: cute.Tensor,
+        seqlen: cutlass.Int32,
     ):
         self.a_major_mode = utils.LayoutEnum.from_tensor(mA)
         self.b_major_mode = utils.LayoutEnum.from_tensor(mB)
@@ -124,7 +125,7 @@ class TensorOpGemmI8Rotary(TensorOpGemmI8):
         self.kernel(
             mA, mB, mC, mScaleA, mScaleB, mSin, mCos,
             sA_layout, sB_layout,
-            tiled_copy_A, tiled_copy_B, tiled_mma, raster_factor,
+            tiled_copy_A, tiled_copy_B, tiled_mma, raster_factor, seqlen,
         ).launch(
             grid=rasterization_remap_grid_dim,
             block=[self.num_threads, 1, 1],
@@ -147,6 +148,7 @@ class TensorOpGemmI8Rotary(TensorOpGemmI8):
         tiled_copy_B: cute.TiledCopy,
         tiled_mma: cute.TiledMma,
         rasterization_factor: cutlass.Int32,
+        seqlen: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, bidy, bidz = cute.arch.block_idx()
@@ -363,7 +365,7 @@ class TensorOpGemmI8Rotary(TensorOpGemmI8):
 
                         r = cutlass.Int32(tCcC[i, m, n][0])
                         c = cutlass.Int32(tCcC[i, m, n][1])
-                        seq = (row0 + r) % cutlass.Int32(self.seqlen)
+                        seq = (row0 + r) % seqlen
                         pos = c % cutlass.Int32(self.head_dim)
                         self_v = (tCrC[i, m, n].to(cutlass.Float32)
                                   * rScaleA[i, m, 0] * rScaleB[i, 0, n])
@@ -422,12 +424,15 @@ def export_gemm_i8_rotary(
     """AOT-compile the fused INT8 GEMM + rotary kernel and emit a C header.
 
     Computes C[M,N] = rotary(A@B^T) for QKV, fp16 output. N = 3*nhead*head_dim.
-    nhead/head_dim/rotary_dim/seqlen and the tile/atom config are baked at export
-    (seqlen is compile-time here, unlike the FlyDSL kernel's runtime seqlen);
-    M is dynamic at runtime. bn must be a multiple of head_dim.
+    nhead/head_dim/rotary_dim and the tile/atom config are baked at export; M and
+    the sequence length are dynamic at runtime. `seqlen` here sizes the baked
+    sin/cos table (the MAX supported sequence length); the actual seqlen is passed
+    as a runtime scalar at launch and may be any value in [1, seqlen].
+    bn must be a multiple of head_dim.
 
-    Emits <file_path>/<file_name>.h with tensor structs for all 7 arguments in
-    __call__ order: mA, mB, mC, mScaleA, mScaleB, mSin, mCos.
+    Emits <file_path>/<file_name>.h with structs for the 7 tensor arguments in
+    __call__ order (mA, mB, mC, mScaleA, mScaleB, mSin, mCos) plus a trailing
+    runtime int32 `seqlen` scalar argument.
     """
     n_size = 3 * nhead * head_dim
     rotary_half = rotary_dim // 2
@@ -439,15 +444,23 @@ def export_gemm_i8_rotary(
         cutlass.Float32, (m_size, l_size), assumed_align=16)
     fake_scale_b = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32, (n_size, l_size), assumed_align=16)
-    # sin/cos are row-major [seqlen, rotary_half] at runtime (contiguous, stride
-    # (rotary_half, 1)). make_fake_compact_tensor defaults to COLUMN-MAJOR
-    # (stride_order left-to-right -> stride (1, seqlen)), which would bake the
-    # wrong strides into mSin[seq, rot_idx] and read garbage/out-of-bounds over
-    # the AOT C ABI. Pin row-major with stride_order=(1, 0).
+    # sin/cos are a row-major [seqlen, rotary_half] table (contiguous, stride
+    # (rotary_half, 1)). The table extent is baked to `seqlen` (the MAX supported
+    # sequence length, e.g. 2048); the ACTUAL sequence length is a separate runtime
+    # scalar (`fake_seqlen` below) so one export serves any seqlen in [1, seqlen].
+    # make_fake_compact_tensor defaults to COLUMN-MAJOR (stride_order left-to-right
+    # -> stride (1, seqlen)), which would bake the wrong strides into
+    # mSin[seq, rot_idx] and read garbage/out-of-bounds over the AOT C ABI. Pin
+    # row-major with stride_order=(1, 0). The baked extent never enters address
+    # math (only stride0=rotary_half does), so a smaller runtime seqlen is fine.
     fake_sin = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32, (seqlen, rotary_half), stride_order=(1, 0), assumed_align=16)
     fake_cos = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32, (seqlen, rotary_half), stride_order=(1, 0), assumed_align=16)
+    # Runtime seqlen scalar: pass a cutlass.Int32 (NOT a Python int) so it stays a
+    # dynamic C-ABI parameter instead of being folded into the modulo. The value
+    # here is only the trace placeholder; the caller sets the real seqlen at launch.
+    fake_seqlen = cutlass.Int32(seqlen)
 
     gemm = TensorOpGemmI8Rotary(
         a_dtype, b_dtype, c_dtype, acc_dtype,
@@ -456,9 +469,10 @@ def export_gemm_i8_rotary(
     )
     print(f"Compiling TensorOpGemmI8Rotary  N={n_size} K={k_size}  tile={bm}x{bn}x64  "
           f"atom={atom_layout_mnk}  nhead={nhead} head_dim={head_dim} "
-          f"rotary_dim={rotary_dim} seqlen={seqlen}")
+          f"rotary_dim={rotary_dim} seqlen(max/table)={seqlen} (runtime-dynamic)")
     compiled = cute.compile(
         gemm, fake_a, fake_b, fake_c, fake_scale_a, fake_scale_b, fake_sin, fake_cos,
+        fake_seqlen,
     )
     print(f"Exporting to {file_path}/{file_name}.h ...")
     compiled.export_to_c(

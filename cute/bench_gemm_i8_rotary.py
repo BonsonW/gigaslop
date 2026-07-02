@@ -72,6 +72,9 @@ mScaleB = from_dlpack(scale_b_t, assumed_align=16)
 sin_g = sin_buf.cuda(); cos_g = cos_buf.cuda()
 mSin = from_dlpack(sin_g, assumed_align=16)
 mCos = from_dlpack(cos_g, assumed_align=16)
+# seqlen is a runtime scalar now (table extent stays baked). Pass cutlass.Int32
+# so it lowers to a runtime modulo divisor rather than a folded constant.
+seqlen_arg = cutlass.Int32(seqlen)
 
 gemm = TensorOpGemmI8Rotary(
     a_dtype, b_dtype, c_dtype, acc_dtype, atom_layout_mnk, use_k32, bm,
@@ -80,11 +83,11 @@ gemm = TensorOpGemmI8Rotary(
 )
 print(f"M={M} K={K} N={N}  tile={bm}x{bN}x{bK}  nhead={nhead} head_dim={head_dim} rotary_dim={rotary_dim}")
 print("=== Compiling GEMM + rotary ===")
-compiled = cute.compile(gemm, mA, mB, mC, mScaleA, mScaleB, mSin, mCos)
+compiled = cute.compile(gemm, mA, mB, mC, mScaleA, mScaleB, mSin, mCos, seqlen_arg)
 
 if verify_correctness:
     print("=== Verifying correctness ===")
-    compiled(mA, mB, mC, mScaleA, mScaleB, mSin, mCos)
+    compiled(mA, mB, mC, mScaleA, mScaleB, mSin, mCos, seqlen_arg)
     torch.cuda.synchronize()
     with torch.inference_mode():
         ref = rotary_ref(A_int8.cuda(), B_int8.cuda(), scale_a.cuda(), scale_b.cuda(),
@@ -99,11 +102,11 @@ print("=== Benchmarking ===")
 # short warmup finishes before clocks boost, under-reporting TOPS by ~25%. Warm the
 # GPU with a sustained run first so the measured number reflects steady-state clocks.
 for _ in range(400):
-    compiled(mA, mB, mC, mScaleA, mScaleB, mSin, mCos)
+    compiled(mA, mB, mC, mScaleA, mScaleB, mSin, mCos, seqlen_arg)
 torch.cuda.synchronize()
 t = cute.testing.benchmark(
     compiled,
-    kernel_arguments=cute.testing.JitArguments(mA, mB, mC, mScaleA, mScaleB, mSin, mCos),
+    kernel_arguments=cute.testing.JitArguments(mA, mB, mC, mScaleA, mScaleB, mSin, mCos, seqlen_arg),
     warmup_iterations=10, iterations=100,
 )
 tops = (2 * M * N * K) / (t * 1e-6) / 1e12

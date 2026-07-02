@@ -8,9 +8,12 @@
 // Build/run:  cute/build_rotary_test.sh
 //
 // Matches the exported kernel gemm_i8_rotary_N1536_K512_H8D64R64S1024:
-//   nhead=8 head_dim=64 rotary_dim=64 seqlen=1024  ->  N=1536, K=512.
-// scale/sin/cos shapes are baked at export, so M is pinned to the exported
-// m_size (256) — the scale tensor descriptor carries no dynamic shape.
+//   nhead=8 head_dim=64 rotary_dim=64  ->  N=1536, K=512.
+// The sin/cos table is baked at its MAX size (kSeqTable=1024 rows), but the
+// actual sequence length is a RUNTIME scalar argument to the wrapper. Override it
+// with ROTARY_SEQLEN=<n> (default 1024, must be <= kSeqTable) to prove one .o
+// serves any seqlen without re-export. scale/sin/cos descriptors carry no dynamic
+// shape, so M is still pinned to the exported m_size (256) here.
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -35,7 +38,7 @@
 static constexpr int kNHead = 8;
 static constexpr int kHeadDim = 64;
 static constexpr int kRotaryDim = 64;
-static constexpr int kSeqLen = 1024;
+static constexpr int kSeqTable = 1024;               // baked sin/cos table rows (max seqlen)
 static constexpr int kRotaryHalf = kRotaryDim / 2;   // 32
 
 static constexpr int M = 256;                         // == exported m_size
@@ -71,6 +74,16 @@ static void quantize_per_row(const std::vector<float> &in, int rows, int cols,
 }
 
 int main() {
+    // Runtime sequence length (dynamic scalar arg). Override with ROTARY_SEQLEN.
+    // Must be <= kSeqTable (the baked sin/cos table size).
+    int32_t run_seqlen = kSeqTable;
+    if (const char *e = std::getenv("ROTARY_SEQLEN")) run_seqlen = std::atoi(e);
+    if (run_seqlen < 1 || run_seqlen > kSeqTable) {
+        std::printf("ROTARY_SEQLEN=%d out of range [1, %d]\n", run_seqlen, kSeqTable);
+        return 2;
+    }
+    std::printf("seqlen (runtime) = %d   (table = %d)\n", run_seqlen, kSeqTable);
+
     // ---- host inputs --------------------------------------------------------
     std::vector<float> h_a_f(M * K), h_b_f(N * K);
     std::vector<int8_t> h_a(M * K), h_b(N * K);
@@ -88,8 +101,8 @@ int main() {
     // (seq,rot) indexing error, so PASS there + FAIL below pins the bug to
     // sin/cos indexing rather than the argument wiring.
     const bool identity = std::getenv("ROTARY_IDENTITY") != nullptr;
-    std::vector<float> h_sin(kSeqLen * kRotaryHalf), h_cos(kSeqLen * kRotaryHalf);
-    for (int s = 0; s < kSeqLen; ++s)
+    std::vector<float> h_sin(kSeqTable * kRotaryHalf), h_cos(kSeqTable * kRotaryHalf);
+    for (int s = 0; s < kSeqTable; ++s)
         for (int i = 0; i < kRotaryHalf; ++i) {
             float inv_freq = std::pow(10000.0f, -(2.0f * i) / kHeadDim);
             float ang = s * inv_freq;
@@ -142,7 +155,7 @@ int main() {
     T(_Tensor_mSin_t) mSin{d_sin};
     T(_Tensor_mCos_t) mCos{d_cos};
 
-    int32_t ret = CAT(cute_dsl_, T(_wrapper))(&module, &mA, &mB, &mC, &mScaleA, &mScaleB, &mSin, &mCos);
+    int32_t ret = CAT(cute_dsl_, T(_wrapper))(&module, &mA, &mB, &mC, &mScaleA, &mScaleB, &mSin, &mCos, run_seqlen);
     if (ret != 0) std::printf("kernel returned error code: %d\n", ret);
     CUTE_DSL_CUDA_ERROR_CHECK(cudaDeviceSynchronize());
     CUTE_DSL_CUDA_ERROR_CHECK(cudaMemcpy(h_c.data(), d_c, h_c.size() * sizeof(__half), cudaMemcpyDeviceToHost));
@@ -158,7 +171,7 @@ int main() {
             ref[r * N + c] = acc;
         }
     for (int r = 0; r < M; ++r) {
-        int seq = r % kSeqLen;
+        int seq = r % run_seqlen;
         for (int head0 = 0; head0 < kKCols; head0 += kHeadDim) {   // Q chunk, then K chunk
             for (int i = 0; i < kRotaryHalf; ++i) {
                 float cs = h_cos[seq * kRotaryHalf + i], sn = h_sin[seq * kRotaryHalf + i];
